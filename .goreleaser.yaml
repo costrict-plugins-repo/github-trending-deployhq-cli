@@ -1,0 +1,85 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: dhq
+    main: ./cmd/dhq
+    binary: dhq
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X github.com/deployhq/deployhq-cli/internal/telemetry.mixpanelToken={{.Env.MIXPANEL_TOKEN}} -X github.com/deployhq/deployhq-cli/internal/telemetry.environment={{.Env.MIXPANEL_ENV}}
+
+archives:
+  - id: dhq
+    builds:
+      - dhq
+    name_template: "dhq_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+brews:
+  - name: dhq
+    repository:
+      owner: deployhq
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://www.deployhq.com"
+    description: "DeployHQ CLI — deploy from your terminal"
+    license: "MIT"
+    install: |
+      bin.install "dhq"
+    test: |
+      system "#{bin}/dhq", "version"
+
+scoops:
+  - name: dhq
+    repository:
+      owner: deployhq
+      name: scoop-bucket
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://www.deployhq.com"
+    description: "DeployHQ CLI — deploy from your terminal"
+    license: "MIT"
+
+nfpms:
+  - id: dhq
+    package_name: dhq
+    vendor: DeployHQ
+    homepage: "https://www.deployhq.com"
+    description: "DeployHQ CLI — deploy from your terminal"
+    license: "MIT"
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+
+release:
+  github:
+    owner: deployhq
+    name: deployhq-cli
+  prerelease: auto

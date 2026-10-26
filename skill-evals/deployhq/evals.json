@@ -1,0 +1,687 @@
+{
+  "$schema": "https://raw.githubusercontent.com/mailtrap/mailtrap-cli/main/skill-evals/schema.json",
+  "name": "deployhq-cli",
+  "description": "Evaluates whether an AI agent correctly translates natural language into DeployHQ CLI commands",
+  "version": "1.0.0",
+  "evals": [
+    {
+      "id": "list-projects",
+      "category": "projects",
+      "prompt": "Show me all my projects",
+      "expected": {
+        "command": "dhq projects list",
+        "flags": ["--json"]
+      },
+      "must_not_contain": ["api GET"]
+    },
+    {
+      "id": "show-project",
+      "category": "projects",
+      "prompt": "Show me details about the 'my-app' project",
+      "expected": {
+        "command": "dhq projects show",
+        "args": ["my-app"],
+        "flags": ["--json"]
+      }
+    },
+    {
+      "id": "create-project",
+      "category": "projects",
+      "prompt": "Create a new project called 'website-redesign'",
+      "expected": {
+        "command": "dhq projects create",
+        "flags": ["--name", "website-redesign", "--json"]
+      }
+    },
+    {
+      "id": "deploy-basic",
+      "category": "deployments",
+      "prompt": "Deploy the my-app project",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "--json"]
+      },
+      "must_not_contain": ["deployments create"]
+    },
+    {
+      "id": "deploy-branch-server",
+      "category": "deployments",
+      "prompt": "Deploy the staging branch of my-app to the Staging server",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "-b", "staging", "-s", "Staging"]
+      }
+    },
+    {
+      "id": "deploy-wait",
+      "category": "deployments",
+      "prompt": "Deploy my-app and wait until it finishes",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "--wait"]
+      }
+    },
+    {
+      "id": "deploy-wait-timeout",
+      "category": "deployments",
+      "prompt": "Deploy my-app, wait for it, but give up after 5 minutes",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "--wait", "--timeout", "300"]
+      }
+    },
+    {
+      "id": "list-deployments",
+      "category": "deployments",
+      "prompt": "Show recent deployments for my-app",
+      "expected": {
+        "command": "dhq deployments list",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "show-deployment",
+      "category": "deployments",
+      "prompt": "Show me details of deployment abc123 in my-app",
+      "expected": {
+        "command": "dhq deployments show",
+        "args": ["abc123"],
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "deployment-logs",
+      "category": "deployments",
+      "prompt": "Show me the logs for deployment abc123 in my-app",
+      "expected": {
+        "command": "dhq deployments logs",
+        "args": ["abc123"],
+        "flags": ["-p", "my-app"]
+      }
+    },
+    {
+      "id": "deployment-logs-step",
+      "category": "deployments",
+      "prompt": "Show me step 2 logs for deployment abc123",
+      "expected": {
+        "command": "dhq deployments logs",
+        "args": ["abc123"],
+        "flags": ["--step", "2"]
+      }
+    },
+    {
+      "id": "watch-deployment",
+      "category": "deployments",
+      "prompt": "Watch deployment abc123 in real-time",
+      "expected": {
+        "command": "dhq deployments watch",
+        "args": ["abc123"],
+        "flags": ["-p"]
+      }
+    },
+    {
+      "id": "abort-deployment",
+      "category": "deployments",
+      "prompt": "Cancel the running deployment abc123 on my-app",
+      "expected": {
+        "command": "dhq deployments abort",
+        "args": ["abc123"],
+        "flags": ["-p", "my-app"]
+      }
+    },
+    {
+      "id": "rollback",
+      "category": "deployments",
+      "prompt": "Rollback deployment abc123 on my-app",
+      "expected": {
+        "command": "dhq rollback",
+        "args": ["abc123"],
+        "flags": ["-p", "my-app", "--json"]
+      },
+      "alternatives": ["dhq deployments rollback abc123"]
+    },
+    {
+      "id": "retry-deployment",
+      "category": "deployments",
+      "prompt": "Retry the failed deployment abc123",
+      "expected": {
+        "command": "dhq retry",
+        "args": ["abc123"],
+        "flags": ["-p"]
+      },
+      "alternatives": ["dhq deployments retry abc123"]
+    },
+    {
+      "id": "list-servers",
+      "category": "servers",
+      "prompt": "List all servers in my-app",
+      "expected": {
+        "command": "dhq servers list",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "create-ssh-server",
+      "category": "servers",
+      "prompt": "Add an SSH server called 'Production' at example.com with user 'deploy' to my-app",
+      "expected": {
+        "command": "dhq servers create",
+        "flags": ["-p", "my-app", "--name", "Production", "--protocol-type", "ssh", "--hostname", "example.com", "--username", "deploy", "--json"]
+      }
+    },
+    {
+      "id": "create-s3-server",
+      "category": "servers",
+      "prompt": "Add an S3 deployment target for bucket 'my-assets' to project my-app",
+      "expected": {
+        "command": "dhq servers create",
+        "flags": ["-p", "my-app", "--protocol-type", "s3", "--bucket-name", "my-assets"]
+      }
+    },
+    {
+      "id": "delete-server",
+      "category": "servers",
+      "prompt": "Remove server srv-001 from my-app",
+      "expected": {
+        "command": "dhq servers delete",
+        "args": ["srv-001"],
+        "flags": ["-p", "my-app"]
+      }
+    },
+    {
+      "id": "list-branches",
+      "category": "repos",
+      "prompt": "What branches are available in my-app?",
+      "expected": {
+        "command": "dhq repos branches",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "list-commits",
+      "category": "repos",
+      "prompt": "Show recent commits on the develop branch of my-app",
+      "expected": {
+        "command": "dhq repos commits",
+        "flags": ["-p", "my-app", "--branch", "develop", "--json"]
+      }
+    },
+    {
+      "id": "connect-repo",
+      "category": "repos",
+      "prompt": "Connect the git repo git@github.com:org/app.git to my-app",
+      "expected": {
+        "command": "dhq repos create",
+        "flags": ["-p", "my-app", "--scm-type", "git", "--url", "git@github.com:org/app.git", "--json"]
+      }
+    },
+    {
+      "id": "create-env-var",
+      "category": "configuration",
+      "prompt": "Set the DATABASE_URL environment variable to 'postgres://localhost/mydb' on my-app",
+      "expected": {
+        "command": "dhq env-vars create",
+        "flags": ["-p", "my-app", "--name", "DATABASE_URL", "--value", "postgres://localhost/mydb", "--json"]
+      },
+      "must_not_contain": ["api POST"]
+    },
+    {
+      "id": "create-locked-env-var",
+      "category": "configuration",
+      "prompt": "Add a secret API key 'sk-123' as a locked env var called SECRET_KEY to my-app",
+      "expected": {
+        "command": "dhq env-vars create",
+        "flags": ["-p", "my-app", "--name", "SECRET_KEY", "--value", "sk-123", "--locked", "--json"]
+      }
+    },
+    {
+      "id": "list-env-vars",
+      "category": "configuration",
+      "prompt": "Show all environment variables for my-app",
+      "expected": {
+        "command": "dhq env-vars list",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "create-config-file",
+      "category": "configuration",
+      "prompt": "Add a .env config file with content 'APP_ENV=production' to my-app",
+      "expected": {
+        "command": "dhq config-files create",
+        "flags": ["-p", "my-app", "--path", ".env", "--body", "APP_ENV=production", "--json"]
+      }
+    },
+    {
+      "id": "add-build-command",
+      "category": "configuration",
+      "prompt": "Add a build command called 'Install' that runs 'npm install' to my-app",
+      "expected": {
+        "command": "dhq build-commands create",
+        "flags": ["-p", "my-app", "--name", "Install", "--command", "npm install", "--json"]
+      }
+    },
+    {
+      "id": "exclude-files",
+      "category": "configuration",
+      "prompt": "Exclude node_modules from deployments on my-app",
+      "expected": {
+        "command": "dhq excluded-files create",
+        "flags": ["-p", "my-app", "--pattern", "node_modules", "--json"]
+      }
+    },
+    {
+      "id": "add-ssh-command",
+      "category": "configuration",
+      "prompt": "Add an SSH command to restart the app service after deploy on my-app",
+      "expected": {
+        "command": "dhq ssh-commands create",
+        "flags": ["-p", "my-app", "--command"]
+      }
+    },
+    {
+      "id": "test-server-access",
+      "category": "operations",
+      "prompt": "Test if we can connect to servers in my-app",
+      "expected": {
+        "command": "dhq test-access",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "project-activity",
+      "category": "operations",
+      "prompt": "Show recent activity for my-app",
+      "expected": {
+        "command": "dhq activity list",
+        "flags": ["--json"]
+      }
+    },
+    {
+      "id": "project-status",
+      "category": "operations",
+      "prompt": "What's the current status of my-app?",
+      "expected": {
+        "command": "dhq status",
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "raw-api-get",
+      "category": "operations",
+      "prompt": "Make a raw API call to GET /projects/my-app/webhooks",
+      "expected": {
+        "command": "dhq api",
+        "args": ["GET", "/projects/my-app/webhooks"]
+      }
+    },
+    {
+      "id": "raw-api-post",
+      "category": "operations",
+      "prompt": "Make a POST request to /projects/my-app/deployments with body {\"deployment\":{\"branch\":\"main\"}}",
+      "expected": {
+        "command": "dhq api",
+        "args": ["POST", "/projects/my-app/deployments"],
+        "flags": ["--body"]
+      }
+    },
+    {
+      "id": "check-auth",
+      "category": "auth",
+      "prompt": "Am I logged in?",
+      "expected": {
+        "command": "dhq auth status"
+      }
+    },
+    {
+      "id": "login-noninteractive",
+      "category": "auth",
+      "prompt": "Login to the 'mycompany' account with email user@example.com and API key abc123",
+      "expected": {
+        "command": "dhq auth login",
+        "flags": ["--account", "mycompany", "--email", "user@example.com", "--api-key", "abc123"]
+      }
+    },
+    {
+      "id": "diagnose-cli",
+      "category": "operations",
+      "prompt": "Something is wrong with my CLI setup, help me diagnose",
+      "expected": {
+        "command": "dhq doctor"
+      }
+    },
+    {
+      "id": "open-in-browser",
+      "category": "operations",
+      "prompt": "Open my-app in the browser",
+      "expected": {
+        "command": "dhq open",
+        "args": ["my-app"]
+      }
+    },
+    {
+      "id": "json-field-selection",
+      "category": "output",
+      "prompt": "List my projects but only show name and permalink",
+      "expected": {
+        "command": "dhq projects list",
+        "flags": ["--json", "name,permalink"]
+      }
+    },
+    {
+      "id": "setup-auto-deploy",
+      "category": "configuration",
+      "prompt": "Enable auto-deploy on the main branch to Production for my-app",
+      "expected": {
+        "command": "dhq auto-deploys enable",
+        "flags": ["-p", "my-app", "--branch", "main", "--server", "Production"]
+      }
+    },
+    {
+      "id": "schedule-deploy",
+      "category": "configuration",
+      "prompt": "Schedule a nightly deploy at 2am for my-app on the main branch",
+      "expected": {
+        "command": "dhq scheduled-deploys create",
+        "flags": ["-p", "my-app", "--cron", "--branch", "main"]
+      }
+    },
+    {
+      "id": "list-zones",
+      "category": "global",
+      "prompt": "What deployment zones are available?",
+      "expected": {
+        "command": "dhq zones list",
+        "flags": ["--json"]
+      }
+    },
+    {
+      "id": "copy-global-server",
+      "category": "global",
+      "prompt": "Copy global server 12345 to project my-app",
+      "expected": {
+        "command": "dhq global-servers copy",
+        "args": ["12345"],
+        "flags": ["-p", "my-app", "--json"]
+      }
+    },
+    {
+      "id": "multi-step-deploy-workflow",
+      "category": "workflows",
+      "prompt": "I want to deploy. First show me my projects, then I'll pick one.",
+      "expected": {
+        "command": "dhq projects list",
+        "flags": ["--json"]
+      },
+      "notes": "Agent should start with project listing, then chain to servers list, then deploy"
+    },
+    {
+      "id": "troubleshoot-failed-deploy",
+      "category": "workflows",
+      "prompt": "My last deployment failed. Help me figure out what went wrong.",
+      "expected": {
+        "command": "dhq deployments list",
+        "flags": ["-p", "--json"]
+      },
+      "notes": "Agent should list deployments to find the failed one, then show logs"
+    },
+    {
+      "id": "full-project-setup",
+      "category": "workflows",
+      "prompt": "Set up a new project called 'api-service' with a git repo at git@github.com:org/api.git and an SSH server at api.example.com",
+      "expected": {
+        "command": "dhq projects create",
+        "flags": ["--name", "api-service", "--json"]
+      },
+      "notes": "Multi-step: create project → create repo → create server. Agent should chain these."
+    },
+    {
+      "id": "avoid-interactive-envvar",
+      "category": "gotchas",
+      "prompt": "Create an environment variable called API_KEY with value 'secret123' on my-app",
+      "expected": {
+        "command": "dhq env-vars create",
+        "flags": ["-p", "my-app", "--name", "API_KEY", "--value", "secret123"]
+      },
+      "must_not_contain": ["--value omitted", "prompt"],
+      "notes": "Agent must always include --value to avoid interactive prompt"
+    },
+    {
+      "id": "use-shortcut-deploy",
+      "category": "gotchas",
+      "prompt": "Deploy my-app to production",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app"]
+      },
+      "must_not_contain": ["deployments create"],
+      "notes": "Should use 'dhq deploy' shortcut, not 'dhq deployments create'"
+    },
+    {
+      "id": "use-shortcut-rollback",
+      "category": "gotchas",
+      "prompt": "Rollback deployment abc123",
+      "expected": {
+        "command": "dhq rollback",
+        "args": ["abc123"]
+      },
+      "must_not_contain": ["deployments rollback"],
+      "notes": "Should prefer shortcut 'dhq rollback' over 'dhq deployments rollback'"
+    },
+
+    {
+      "id": "workflow-diagnose-failed-deploy",
+      "category": "agent-workflows",
+      "prompt": "Deployment xyz789 on my-app just failed. Help me figure out what went wrong and fix it.",
+      "expected": {
+        "command": "dhq deployments logs",
+        "args": ["xyz789"],
+        "flags": ["-p", "my-app"]
+      },
+      "notes": "First step in diagnosing a failed deployment is reading the logs. Agent should then suggest rollback or retry based on output."
+    },
+    {
+      "id": "workflow-non-interactive-deploy",
+      "category": "agent-workflows",
+      "prompt": "Deploy my-app to Production server in a CI pipeline where no interactive prompts are allowed",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "-s", "Production", "--json"]
+      },
+      "must_not_contain": ["--interactive", "init", "hello"],
+      "notes": "Agent must always specify --server explicitly to avoid interactive picker. --non-interactive is auto-enabled in CI."
+    },
+    {
+      "id": "workflow-rollback-after-failure",
+      "category": "agent-workflows",
+      "prompt": "The latest deployment abc123 on my-app failed. Roll it back.",
+      "expected": {
+        "command": "dhq rollback",
+        "args": ["abc123"],
+        "flags": ["-p", "my-app", "--json"]
+      },
+      "notes": "Direct rollback of a known failed deployment."
+    },
+    {
+      "id": "workflow-check-metadata-safety",
+      "category": "agent-workflows",
+      "prompt": "I want to see which commands are safe to run automatically without human oversight",
+      "expected": {
+        "command": "dhq commands",
+        "flags": ["--json"]
+      },
+      "notes": "Agent should use 'dhq commands --json' and inspect the 'agent.safe_for_automation' field."
+    },
+    {
+      "id": "workflow-doctor-connectivity",
+      "category": "agent-workflows",
+      "prompt": "The CLI seems broken — check if everything is configured correctly and we can reach the API",
+      "expected": {
+        "command": "dhq doctor"
+      },
+      "notes": "Doctor checks auth, account, project, config files, and API connectivity."
+    },
+    {
+      "id": "workflow-ambiguous-server-strict",
+      "category": "agent-workflows",
+      "prompt": "Deploy my-app but I'm not sure which server to use. List the servers first.",
+      "expected": {
+        "command": "dhq servers list",
+        "flags": ["-p", "my-app", "--json"]
+      },
+      "notes": "When server is ambiguous, agent should list servers first rather than deploying without --server."
+    },
+    {
+      "id": "workflow-deploy-with-next-actions",
+      "category": "agent-workflows",
+      "prompt": "Deploy my-app and tell me what commands I can run next to monitor it",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "--json"]
+      },
+      "notes": "With --json, the response includes breadcrumbs with watch, status, logs, and abort commands."
+    },
+    {
+      "id": "workflow-deploy-wait-timeout",
+      "category": "agent-workflows",
+      "prompt": "Deploy my-app to staging, wait for it to finish, but give up after 3 minutes",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "-s", "staging", "--wait", "--timeout", "180"]
+      },
+      "notes": "Agent should convert 3 minutes to 180 seconds for the --timeout flag."
+    },
+    {
+      "id": "create-server-deployment-config",
+      "category": "servers",
+      "prompt": "Add a staging server to my-app that deploys the staging branch with zero-downtime deployments, and don't let DeployHQ deploy it automatically on push",
+      "expected": {
+        "command": "dhq servers create",
+        "flags": ["-p", "my-app", "--branch", "staging", "--auto-deploy=false", "--atomic"]
+      },
+      "must_not_contain": ["api POST"],
+      "notes": "Deployment settings are first-class flags on servers create - no dhq api escape hatch needed. Atomic must be set at create time."
+    },
+    {
+      "id": "update-server-branch",
+      "category": "servers",
+      "prompt": "Change server srv-001 in my-app so it deploys the main branch",
+      "expected": {
+        "command": "dhq servers update",
+        "args": ["srv-001"],
+        "flags": ["-p", "my-app", "--branch", "main"]
+      },
+      "must_not_contain": ["api PUT", "api PATCH"],
+      "notes": "--branch is a first-class flag on servers update; omitted flags leave other settings untouched."
+    },
+    {
+      "id": "update-server-auto-deploy",
+      "category": "servers",
+      "prompt": "Turn on DeployHQ's automatic deployments for server srv-001 in my-app",
+      "expected": {
+        "command": "dhq servers update",
+        "args": ["srv-001"],
+        "flags": ["-p", "my-app", "--auto-deploy"]
+      },
+      "must_not_contain": ["api PUT", "api PATCH"],
+      "notes": "Native auto-deployment is toggled with --auto-deploy / --auto-deploy=false."
+    },
+    {
+      "id": "update-atomic-retention",
+      "category": "servers",
+      "prompt": "Keep the last 10 releases on server srv-001 in my-app",
+      "expected": {
+        "command": "dhq servers update",
+        "args": ["srv-001"],
+        "flags": ["-p", "my-app", "--atomic-retention", "10"]
+      },
+      "notes": "Retention is tunable on an existing atomic server; only atomic itself is locked after the first deployment. Must be >= 1."
+    },
+    {
+      "id": "atomic-before-first-deployment",
+      "category": "gotchas",
+      "prompt": "Enable zero-downtime deployments on server srv-001 in my-app - it has been serving production traffic for months",
+      "expected": {
+        "command": "dhq deployments list",
+        "flags": ["-p", "my-app"]
+      },
+      "must_not_contain": ["servers update srv-001 --atomic"],
+      "notes": "Atomic cannot be changed once a server has any deployment. The agent must check for existing deployments or warn the user rather than blindly issuing 'dhq servers update --atomic', which the backend rejects."
+    },
+    {
+      "id": "list-ssh-keys",
+      "category": "global",
+      "prompt": "Show me the SSH keys on my account",
+      "expected": {
+        "command": "dhq ssh-keys list",
+        "flags": ["--json"]
+      },
+      "notes": "The Identifier column is the public identifier used everywhere else."
+    },
+    {
+      "id": "create-ssh-key",
+      "category": "global",
+      "prompt": "Create a new SSH key called 'Ops Recovery Key'",
+      "expected": {
+        "command": "dhq ssh-keys create",
+        "flags": ["--title", "Ops Recovery Key"]
+      },
+      "must_not_contain": ["--name", "--public-key"],
+      "notes": "Keys are generated server-side; --title is the flag, not --name, and there is no --public-key."
+    },
+    {
+      "id": "create-managed-vps-with-existing-key",
+      "category": "servers",
+      "prompt": "Create a Managed VPS called ops in my-app using my existing SSH key key-abc123, in lon1 at s-1vcpu-1gb",
+      "expected": {
+        "command": "dhq servers create",
+        "flags": ["-p", "my-app", "--protocol-type", "managed_vps", "--key-pair-identifier", "key-abc123", "--accept-cost"]
+      },
+      "must_not_contain": ["--global-key-pair-id", "api POST"],
+      "notes": "managed_vps uses --key-pair-identifier with the public identifier; --global-key-pair-id is the ssh/rsync flag and is rejected here. --accept-cost is required non-interactively."
+    },
+    {
+      "id": "verify-managed-vps-key",
+      "category": "servers",
+      "prompt": "Which SSH key was my Managed VPS srv-001 in my-app provisioned with?",
+      "expected": {
+        "command": "dhq servers show",
+        "args": ["srv-001"],
+        "flags": ["-p", "my-app", "managed_vps"]
+      },
+      "notes": "The key is under managed_vps.ssh_key in the read-back."
+    },
+    {
+      "id": "deploy-and-verify-in-automation",
+      "category": "gotchas",
+      "prompt": "In a CI pipeline, deploy my-app to Production and make the job fail if the deployment doesn't succeed",
+      "expected": {
+        "command": "dhq deploy",
+        "flags": ["-p", "my-app", "watch", "show", "completed"]
+      },
+      "must_not_contain": ["--wait"],
+      "notes": "check_eval word-splits expected.flags and substring-matches each token, so single words are used: watch + show + completed together force the whole create -> watch -> assert sequence rather than any one step. --wait is inert outside a TTY: output auto-switches to JSON and the JSON path returns as soon as the deploy is queued, exiting 0."
+    },
+    {
+      "id": "cancelled-deploy-not-success",
+      "category": "gotchas",
+      "prompt": "My deploy script exits 0 but nothing was deployed. How do I detect a cancelled deployment?",
+      "expected": {
+        "command": "dhq deployments show",
+        "flags": ["status"]
+      },
+      "notes": "A cancelled deployment exits 0 from the watcher; only failed is non-zero. The status must be asserted explicitly."
+    },
+    {
+      "id": "post-deploy-reconcile-check",
+      "category": "configuration",
+      "prompt": "Run a reconcile script on my-app's server srv-abc123 after each release, and fail the deployment if it errors",
+      "expected": {
+        "command": "dhq deployment-checks create",
+        "flags": ["-p", "my-app", "--stage", "post_deploy", "--check-type", "ssh", "--servers", "srv-abc123"]
+      },
+      "must_not_contain": ["ssh-commands create"],
+      "notes": "ssh-commands create cannot set callback phase, targeting, timeout or halt-on-error; a post_deploy ssh deployment check can, and fails the deployment on non-zero exit."
+    }
+  ]
+}

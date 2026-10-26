@@ -1,0 +1,37 @@
+# .github/workflows/deploy.yml
+#
+# Deploy via DeployHQ when pushing to main.
+# No `dhq auth login` needed — env vars handle auth in CI.
+#
+# Required repository secrets:
+#   DEPLOYHQ_ACCOUNT  - Account subdomain (e.g. "mycompany")
+#   DEPLOYHQ_EMAIL    - API user email
+#   DEPLOYHQ_API_KEY  - API key (Profile > API Key in DeployHQ)
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  DEPLOYHQ_ACCOUNT: ${{ secrets.DEPLOYHQ_ACCOUNT }}
+  DEPLOYHQ_EMAIL: ${{ secrets.DEPLOYHQ_EMAIL }}
+  DEPLOYHQ_API_KEY: ${{ secrets.DEPLOYHQ_API_KEY }}
+  DEPLOYHQ_PROJECT: my-app  # or use --project flag per command
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install DeployHQ CLI
+        run: curl -fsSL https://deployhq.com/install/cli | sh
+
+      - name: Deploy to production
+        run: dhq deploy --server production --revision ${{ github.sha }} --wait --json
+
+      - name: Show deployment logs (on failure)
+        if: failure()
+        run: |
+          DEP_ID=$(dhq deployments list --json | jq -r '.data.records[0].identifier')
+          dhq deployments logs "$DEP_ID"

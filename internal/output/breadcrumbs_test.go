@@ -1,0 +1,182 @@
+package output
+
+import (
+	"encoding/json"
+	"net/http"
+	"testing"
+
+	"github.com/deployhq/deployhq-cli/pkg/sdk"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNewResponse(t *testing.T) {
+	resp := NewResponse(
+		map[string]string{"id": "123"},
+		"Deployment created",
+		Breadcrumb{Action: "logs", Cmd: "dhq deployments logs 123"},
+		Breadcrumb{Action: "abort", Cmd: "dhq deployments abort 123"},
+	)
+
+	assert.True(t, resp.OK)
+	assert.Equal(t, "Deployment created", resp.Summary)
+	assert.Len(t, resp.Breadcrumbs, 2)
+	assert.Equal(t, "logs", resp.Breadcrumbs[0].Action)
+}
+
+func TestResponse_JSONShape(t *testing.T) {
+	resp := NewResponse([]string{"a", "b"}, "2 items")
+
+	b, err := json.Marshal(resp)
+	require.NoError(t, err)
+
+	var raw map[string]interface{}
+	require.NoError(t, json.Unmarshal(b, &raw))
+
+	assert.True(t, raw["ok"].(bool))
+	assert.Equal(t, "2 items", raw["summary"])
+	assert.NotNil(t, raw["data"])
+}
+
+func TestNewPaginatedResponse(t *testing.T) {
+	resp := NewPaginatedResponse(
+		[]string{"a", "b"},
+		Pagination{CurrentPage: 2, TotalPages: 5, TotalRecords: 50, Offset: 10},
+		"test summary",
+	)
+	assert.True(t, resp.OK)
+	assert.NotNil(t, resp.Pagination)
+	assert.Equal(t, 2, resp.Pagination.CurrentPage)
+	assert.Equal(t, 5, resp.Pagination.TotalPages)
+	assert.Equal(t, 50, resp.Pagination.TotalRecords)
+	assert.Equal(t, 10, resp.Pagination.Offset)
+	assert.Equal(t, "test summary", resp.Summary)
+}
+
+func TestNewResponse_NoPagination(t *testing.T) {
+	resp := NewResponse([]string{"a"}, "test")
+	assert.Nil(t, resp.Pagination)
+
+	b, err := json.Marshal(resp)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(b), "pagination")
+}
+
+func TestNewPaginatedResponse_IncludesPaginationInJSON(t *testing.T) {
+	resp := NewPaginatedResponse(
+		[]string{"a"},
+		Pagination{CurrentPage: 1, TotalPages: 3, TotalRecords: 30, Offset: 0},
+		"test",
+	)
+	b, err := json.Marshal(resp)
+	assert.NoError(t, err)
+	assert.Contains(t, string(b), `"pagination"`)
+	assert.Contains(t, string(b), `"current_page":1`)
+	assert.Contains(t, string(b), `"total_pages":3`)
+}
+
+func TestErrorResponse(t *testing.T) {
+	resp := ErrorResponse("timeout", "Deploy timed out", "Increase --wait-timeout", "https://docs.example.com")
+
+	assert.False(t, resp.OK)
+	data := resp.Data.(ErrorData)
+	assert.Equal(t, "timeout", data.Code)
+	assert.Equal(t, "Deploy timed out", data.Error)
+	assert.Equal(t, "Increase --wait-timeout", data.Suggestion)
+	assert.Equal(t, "https://docs.example.com", data.DocURL)
+}
+
+func TestErrorResponseFromErr_UserError(t *testing.T) {
+	err := &UserError{Message: "No project specified", Hint: "Use --project flag"}
+	resp := ErrorResponseFromErr(err)
+
+	assert.False(t, resp.OK)
+	data := resp.Data.(ErrorData)
+	assert.Equal(t, "user_error", data.Code)
+	assert.Equal(t, ExitUserError, data.ExitCode)
+	assert.Equal(t, "No project specified", data.Error)
+	assert.Equal(t, "Use --project flag", data.Suggestion)
+	assert.False(t, data.Retryable)
+}
+
+func TestErrorResponseFromErr_AuthError(t *testing.T) {
+	err := &AuthError{Message: "Not logged in", Hint: "Run dhq auth login"}
+	resp := ErrorResponseFromErr(err)
+
+	data := resp.Data.(ErrorData)
+	assert.Equal(t, "auth_error", data.Code)
+	assert.Equal(t, ExitAuthError, data.ExitCode)
+	assert.NotEmpty(t, data.Recovery)
+	assert.Equal(t, "login", data.Recovery[0].Action)
+}
+
+func TestErrorResponseFromErr_Retryable(t *testing.T) {
+	err := &InternalError{Message: "rate_limit exceeded"}
+	resp := ErrorResponseFromErr(err)
+
+	data := resp.Data.(ErrorData)
+	assert.True(t, data.Retryable)
+}
+
+func TestErrorResponseFromErr_APIErrorByStatus(t *testing.T) {
+	cases := []struct {
+		status   int
+		wantCode string
+		wantExit int
+	}{
+		{401, "auth_error", ExitAuthError},
+		{403, "auth_error", ExitAuthError},
+		{404, "not_found", ExitNotFoundError},
+		{409, "conflict", ExitConflictError},
+		{422, "user_error", ExitUserError},
+		{500, "internal_error", ExitInternalError},
+		{503, "internal_error", ExitInternalError},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			err := &sdk.APIError{StatusCode: tc.status, Message: "x"}
+			data := ErrorResponseFromErr(err).Data.(ErrorData)
+			assert.Equal(t, tc.wantCode, data.Code, "code mismatch")
+			assert.Equal(t, tc.wantExit, data.ExitCode, "exit_code mismatch")
+		})
+	}
+}
+
+func TestErrorResponseFromErr_NetworkError(t *testing.T) {
+	err := &NetworkError{Message: "validate credentials"}
+	data := ErrorResponseFromErr(err).Data.(ErrorData)
+	assert.Equal(t, "network_error", data.Code)
+	assert.Equal(t, ExitNetworkError, data.ExitCode)
+}
+
+func TestErrorData_JSONShape(t *testing.T) {
+	resp := ErrorResponseFromErr(&UserError{Message: "test error"})
+
+	b, err := json.Marshal(resp)
+	require.NoError(t, err)
+
+	var raw map[string]interface{}
+	require.NoError(t, json.Unmarshal(b, &raw))
+
+	assert.False(t, raw["ok"].(bool))
+	data := raw["data"].(map[string]interface{})
+	assert.Equal(t, "user_error", data["code"])
+	assert.Equal(t, "test error", data["error"])
+	assert.NotNil(t, data["exit_code"])
+	_, hasRetryable := data["retryable"]
+	assert.True(t, hasRetryable)
+}
+
+func TestBreadcrumb_ResourceFields(t *testing.T) {
+	b := Breadcrumb{
+		Action:   "watch",
+		Cmd:      "dhq deployments watch abc -p proj",
+		Resource: "deployment",
+		ID:       "abc",
+	}
+
+	data, err := json.Marshal(b)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"resource":"deployment"`)
+	assert.Contains(t, string(data), `"id":"abc"`)
+}

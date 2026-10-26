@@ -1,0 +1,359 @@
+package commands
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/deployhq/deployhq-cli/internal/auth"
+	"github.com/deployhq/deployhq-cli/internal/config"
+	"github.com/deployhq/deployhq-cli/internal/output"
+	"github.com/deployhq/deployhq-cli/pkg/sdk"
+	"github.com/manifoldco/promptui"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+)
+
+func newHelloCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "hello",
+		Short: "Get started with DeployHQ CLI",
+		Long:  "Guided setup that walks you through login, account creation, project configuration, and installing the DeployHQ skill into the user-scope AI coding agents detected on this machine.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env := cliCtx.Envelope
+
+			if env.NonInteractive {
+				return &output.UserError{
+					Message: "'dhq hello' is interactive-only and cannot run in non-interactive mode",
+					Hint:    "Use the non-interactive equivalents:\n  dhq auth login --account <acct> --email <email> --api-key <key>\n  dhq config set project <permalink>",
+				}
+			}
+			if !env.IsTTY {
+				return &output.UserError{
+					Message: "Interactive setup requires a terminal",
+					Hint:    "Use 'dhq auth login' and 'dhq configure' for non-interactive setup",
+				}
+			}
+
+			env.Status("")
+			output.ColorGreen.Fprintf(env.Stderr, "Welcome to DeployHQ CLI!\n") //nolint:errcheck
+			env.Status("")
+
+			// Step 1: Authentication
+			loggedIn, creds := checkAuth()
+			if !loggedIn {
+				var err error
+				creds, err = helloAuth(env)
+				if err != nil {
+					return err
+				}
+			} else {
+				host := "deployhq.com"
+				if cliCtx.Config.Host != "" {
+					host = cliCtx.Config.Host
+				}
+				env.Status("Logged in as %s on %s.%s", creds.Email, creds.Account, host)
+			}
+
+			// Step 2: Offer to install the DeployHQ skill for any AI agents
+			// installed on this machine. Auto-installs for the runtime agent,
+			// prompts for others. Non-fatal — hello continues on errors.
+			offerSkillInstall(env)
+
+			// Step 3: Fetch projects
+			var sdkOpts []sdk.Option
+			if baseURL := cliCtx.Config.BaseURL(creds.Account); baseURL != "" {
+				sdkOpts = append(sdkOpts, sdk.WithBaseURL(baseURL))
+			}
+			client, err := sdk.New(creds.Account, creds.Email, creds.APIKey, sdkOpts...)
+			if err != nil {
+				return &output.InternalError{Message: "create client", Cause: err}
+			}
+
+			projects, err := client.ListProjects(cliCtx.Background(), nil)
+			if err != nil {
+				env.Warn("Could not fetch projects: %v", err)
+				env.Status("")
+				env.Status("Get started:")
+				env.Status("  dhq init              Create a project with repo and server")
+				env.Status("  dhq projects create   Create a project")
+				return nil
+			}
+
+			if len(projects) == 0 {
+				env.Status("")
+				env.Status("No projects yet.")
+
+				prompt := promptui.Select{
+					Label: "Create your first project?",
+					Items: []string{"Yes, run guided setup (dhq init)", "No, I'll do it later"},
+				}
+
+				idx, _, err := prompt.Run()
+				if err != nil || idx == 1 {
+					env.Status("")
+					env.Status("When you're ready:")
+					env.Status("  dhq init              Guided project setup (repo + server + deploy)")
+					env.Status("  dhq projects create   Create a project manually")
+					return nil
+				}
+
+				// Run dhq init
+				initCmd := newInitCmd()
+				return initCmd.RunE(initCmd, nil)
+			}
+
+			// Step 4: Default project
+			defaultProject := cliCtx.Config.Project
+			if defaultProject != "" {
+				env.Status("Default project: %s", defaultProject)
+			} else {
+				env.Status("")
+				env.Status("You have %d project(s). Pick a default for this directory:", len(projects))
+
+				items := make([]string, len(projects))
+				for i, p := range projects {
+					items[i] = fmt.Sprintf("%s (%s)", p.Name, p.Permalink)
+				}
+
+				prompt := promptui.Select{
+					Label: "Default project",
+					Items: items,
+				}
+
+				idx, _, err := prompt.Run()
+				if err != nil {
+					return &output.UserError{Message: "Setup cancelled"}
+				}
+
+				project := projects[idx]
+				path := config.ProjectConfigPath()
+				if err := config.Set(path, "project", project.Permalink); err != nil {
+					return &output.InternalError{Message: "save config", Cause: err}
+				}
+
+				env.Status("")
+				output.ColorGreen.Fprintf(env.Stderr, "Saved to %s\n", path) //nolint:errcheck
+			}
+
+			// Step 5: Orientation
+			env.Status("")
+			env.Status("You're all set! Here are some useful commands:")
+			env.Status("  dhq deploy            Deploy your project")
+			env.Status("  dhq deployments list  View deployment history")
+			env.Status("  dhq servers list      View servers")
+			env.Status("  dhq status            Dashboard overview")
+			env.Status("  dhq open              Open project in browser")
+			return nil
+		},
+	}
+}
+
+func checkAuth() (bool, *auth.Credentials) {
+	creds, err := auth.LoadByAccount(cliCtx.Config.Account)
+	if err != nil || creds.APIKey == "" {
+		return false, nil
+	}
+	return true, creds
+}
+
+func helloAuth(env *output.Envelope) (*auth.Credentials, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	// Ask if they have an account
+	prompt := promptui.Select{
+		Label: "Do you have a DeployHQ account?",
+		Items: []string{"Yes, log me in", "No, create one"},
+	}
+
+	idx, _, err := prompt.Run()
+	if err != nil {
+		return nil, &output.UserError{Message: "Setup cancelled"}
+	}
+
+	if idx == 0 {
+		return helloLogin(env, reader)
+	}
+	return helloSignup(env, reader)
+}
+
+func helloLogin(env *output.Envelope, reader *bufio.Reader) (*auth.Credentials, error) {
+	env.Status("")
+
+	fmt.Fprint(env.Stderr, "Account subdomain (e.g. 'mycompany' for mycompany.deployhq.com): ") //nolint:errcheck
+	account, _ := reader.ReadString('\n')
+	account = strings.TrimSpace(account)
+
+	fmt.Fprint(env.Stderr, "Email: ") //nolint:errcheck
+	email, _ := reader.ReadString('\n')
+	email = strings.TrimSpace(email)
+
+	fmt.Fprint(env.Stderr, "API key: ") //nolint:errcheck
+	key, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(env.Stderr) //nolint:errcheck
+	if err != nil {
+		return nil, &output.InternalError{Message: "read API key", Cause: err}
+	}
+	apiKey := strings.TrimSpace(string(key))
+
+	// Validate inputs before reaching sdk.New, which would otherwise surface
+	// raw "deployhq: <field> is required" messages with no guidance on what
+	// to do next. The hint text points users at where each value comes from.
+	if err := validateHelloLoginInputs(account, email, apiKey); err != nil {
+		return nil, err
+	}
+
+	env.Status("Validating credentials...")
+	var sdkOpts []sdk.Option
+	if baseURL := cliCtx.Config.BaseURL(account); baseURL != "" {
+		sdkOpts = append(sdkOpts, sdk.WithBaseURL(baseURL))
+	}
+	client, err := sdk.New(account, email, apiKey, sdkOpts...)
+	if err != nil {
+		return nil, &output.UserError{Message: err.Error()}
+	}
+
+	if _, err := client.ListProjects(cliCtx.Background(), nil); err != nil {
+		if userErr := classifyHelloValidateErr(err); userErr != nil {
+			return nil, userErr
+		}
+		return nil, err
+	}
+
+	creds := &auth.Credentials{Account: account, Email: email, APIKey: apiKey}
+	if err := auth.Store(creds); err != nil {
+		return nil, &output.InternalError{Message: "store credentials", Cause: err}
+	}
+
+	// Save account to global config so subsequent commands find it
+	_ = config.Set(config.GlobalConfigPath(), "account", account)
+
+	host := "deployhq.com"
+	if cliCtx.Config.Host != "" {
+		host = cliCtx.Config.Host
+	}
+	env.Status("")
+	output.ColorGreen.Fprintf(env.Stderr, "Logged in as %s on %s.%s\n", email, account, host) //nolint:errcheck
+	return creds, nil
+}
+
+// validateHelloLoginInputs catches empty fields before sdk.New would, so
+// users see actionable messages instead of the raw "deployhq: api key is
+// required" SDK error. The API-key hint is the most important one: telemetry
+// shows users hit Enter at the masked prompt without knowing where to find
+// the key.
+func validateHelloLoginInputs(account, email, apiKey string) error {
+	if account == "" {
+		return &output.UserError{
+			Message: "Account is required",
+			Hint:    "Enter the subdomain part of your DeployHQ URL (e.g. 'mycompany' for mycompany.deployhq.com).",
+		}
+	}
+	if email == "" {
+		return &output.UserError{
+			Message: "Email is required",
+			Hint:    "Use the email address you sign in to DeployHQ with.",
+		}
+	}
+	if apiKey == "" {
+		return &output.UserError{
+			Message: "API key is required",
+			Hint:    "Find your API key in DeployHQ → Profile → API Key, then re-run 'dhq hello'.",
+		}
+	}
+	return nil
+}
+
+// classifyHelloValidateErr maps an error from the credential-validation API
+// call into a typed *output.AuthError / *output.UserError / *output.NetworkError
+// when the cause is recognizable. Returns nil when the caller should pass the
+// error through unchanged (which lets output.ClassifyError handle status-code
+// fallback for any remaining *sdk.APIError).
+func classifyHelloValidateErr(err error) error {
+	if output.IsNetworkErr(err) {
+		return &output.NetworkError{Message: "validate credentials", Cause: err}
+	}
+	var apiErr *sdk.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusUnauthorized:
+			return &output.AuthError{
+				Message: "Invalid credentials",
+				Hint:    "Check your email and API key at Profile > API Key in DeployHQ",
+			}
+		case http.StatusForbidden:
+			return &output.AuthError{
+				Message: "Access denied",
+				Hint:    "Your account may have API access restricted, or your user may not be a member of this account. Check Account Settings > API.",
+			}
+		case http.StatusNotFound:
+			return &output.UserError{
+				Message: "Account not found",
+				Hint:    "Double-check the account subdomain. List your accounts at https://www.deployhq.com/account.",
+			}
+		}
+	}
+	return nil
+}
+
+func helloSignup(env *output.Envelope, reader *bufio.Reader) (*auth.Credentials, error) {
+	env.Status("")
+
+	fmt.Fprint(env.Stderr, "Email: ") //nolint:errcheck
+	email, _ := reader.ReadString('\n')
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil, &output.UserError{Message: "Email is required"}
+	}
+
+	fmt.Fprint(env.Stderr, "Password: ") //nolint:errcheck
+	pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(env.Stderr) //nolint:errcheck
+	if err != nil {
+		return nil, &output.InternalError{Message: "read password", Cause: err}
+	}
+	password := strings.TrimSpace(string(pw))
+	if password == "" {
+		return nil, &output.UserError{Message: "Password is required"}
+	}
+
+	fmt.Fprint(env.Stderr, "Account name (optional, Enter to auto-generate): ") //nolint:errcheck
+	accountName, _ := reader.ReadString('\n')
+	accountName = strings.TrimSpace(accountName)
+
+	env.Status("Creating account...")
+
+	ua := cliUserAgent()
+	result, err := sdk.Signup(sdk.SignupRequest{
+		Email:       email,
+		Password:    password,
+		AccountName: accountName,
+		Client:      ua,
+	}, ua, cliCtx.Config.SignupURL())
+	if err != nil {
+		return nil, err
+	}
+
+	creds := &auth.Credentials{
+		Account: result.Account.Subdomain,
+		Email:   email,
+		APIKey:  result.APIKey,
+	}
+	if err := auth.Store(creds); err != nil {
+		env.Warn("Could not save credentials: %v", err)
+	}
+
+	// Save account to global config so subsequent commands find it
+	_ = config.Set(config.GlobalConfigPath(), "account", result.Account.Subdomain)
+
+	host := "deployhq.com"
+	if cliCtx.Config.Host != "" {
+		host = cliCtx.Config.Host
+	}
+	env.Status("")
+	output.ColorGreen.Fprintf(env.Stderr, "Account created: %s.%s\n", result.Account.Subdomain, host) //nolint:errcheck
+	return creds, nil
+}
