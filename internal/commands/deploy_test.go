@@ -1,0 +1,787 @@
+package commands
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/deployhq/deployhq-cli/internal/output"
+	"github.com/deployhq/deployhq-cli/pkg/sdk"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestDeployDryRunFlag(t *testing.T) {
+	cmd := NewRootCmd("test")
+	deployCmd, _, _ := cmd.Find([]string{"deploy"})
+	assert.NotNil(t, deployCmd)
+	assert.NotNil(t, deployCmd.Flags().Lookup("dry-run"))
+}
+
+func TestDeployDryRunMutuallyExclusiveWithWait(t *testing.T) {
+	cmd := NewRootCmd("test")
+	cmd.SetArgs([]string{"deploy", "--dry-run", "--wait", "-p", "test-project"})
+	err := cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// newTestSDKClient returns an SDK client wired to the given httptest server.
+func newTestSDKClient(t *testing.T, server *httptest.Server) *sdk.Client {
+	t.Helper()
+	c, err := sdk.New("test", "u@e.com", "k",
+		sdk.WithBaseURL(server.URL),
+		sdk.WithHTTPClient(server.Client()),
+	)
+	require.NoError(t, err)
+	return c
+}
+
+// branchEndpointMux serves /branches and /servers/:id and /latest_revision and
+// /server_groups/:id. Tracks which endpoints were called so tests can verify the
+// resolution order.
+type branchEndpointMux struct {
+	branches                 map[string]string
+	servers                  map[string]sdk.Server
+	groups                   map[string]sdk.ServerGroup
+	latestRevision           string
+	branchesCalled           bool
+	latestRevCalled          bool
+	getServerCalledWith      string
+	getServerGroupCalledWith string
+}
+
+func (m *branchEndpointMux) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/projects/p/repository/branches":
+			m.branchesCalled = true
+			_ = json.NewEncoder(w).Encode(m.branches)
+		case r.Method == http.MethodGet && r.URL.Path == "/projects/p/repository/latest_revision":
+			m.latestRevCalled = true
+			_ = json.NewEncoder(w).Encode(map[string]string{"ref": m.latestRevision})
+		case r.Method == http.MethodGet && len(r.URL.Path) > len("/projects/p/servers/") &&
+			r.URL.Path[:len("/projects/p/servers/")] == "/projects/p/servers/":
+			id := r.URL.Path[len("/projects/p/servers/"):]
+			m.getServerCalledWith = id
+			s, ok := m.servers[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"not found"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(s)
+		case r.Method == http.MethodGet && len(r.URL.Path) > len("/projects/p/server_groups/") &&
+			r.URL.Path[:len("/projects/p/server_groups/")] == "/projects/p/server_groups/":
+			id := r.URL.Path[len("/projects/p/server_groups/"):]
+			m.getServerGroupCalledWith = id
+			g, ok := m.groups[id]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":"not found"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(g)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}
+}
+
+func TestResolveBranchAndRevision_UsesServerPreferredBranch(t *testing.T) {
+	// Bug fix: when --branch is not specified, the server's preferred_branch
+	// must be used (not the repository's default branch).
+	mux := &branchEndpointMux{
+		branches: map[string]string{
+			"main":    "sha-of-main",
+			"develop": "sha-of-develop",
+		},
+		latestRevision: "sha-of-main", // would be used if branch resolution is broken
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownServer := &sdk.Server{
+		Identifier:      "srv-1",
+		PreferredBranch: "develop",
+	}
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-1", "", "", knownServer, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "develop", branch, "should use server's preferred_branch")
+	assert.Equal(t, "sha-of-develop", revision, "should use develop's tip, not main's")
+	assert.True(t, mux.branchesCalled, "should query /branches to map branch→sha")
+	assert.False(t, mux.latestRevCalled, "should NOT fall back to repo default")
+}
+
+func TestResolveBranchAndRevision_FlagBranchOverridesServerPreferred(t *testing.T) {
+	// Bug fix: when --branch is specified, its tip SHA must be used —
+	// previously end_revision came from the repo default branch and silently
+	// overrode the user's --branch on the API.
+	mux := &branchEndpointMux{
+		branches: map[string]string{
+			"main":      "sha-of-main",
+			"feature-x": "sha-of-feature",
+		},
+		latestRevision: "sha-of-main",
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownServer := &sdk.Server{
+		Identifier:      "srv-1",
+		PreferredBranch: "main",
+	}
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-1", "feature-x", "", knownServer, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "feature-x", branch)
+	assert.Equal(t, "sha-of-feature", revision, "must be feature-x's tip, not main's")
+	assert.False(t, mux.latestRevCalled)
+}
+
+func TestResolveBranchAndRevision_FetchesServerWhenNotKnown(t *testing.T) {
+	// When the caller didn't already resolve the Server (e.g. user passed a
+	// raw UUID), we should fetch it via GetServer to read preferred_branch.
+	mux := &branchEndpointMux{
+		branches: map[string]string{"prod-branch": "sha-of-prod"},
+		servers: map[string]sdk.Server{
+			"srv-uuid": {Identifier: "srv-uuid", PreferredBranch: "prod-branch"},
+		},
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-uuid", "", "", nil, nil, // knownServer = nil, knownGroup = nil
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "prod-branch", branch)
+	assert.Equal(t, "sha-of-prod", revision)
+	assert.Equal(t, "srv-uuid", mux.getServerCalledWith)
+}
+
+func TestResolveBranchAndRevision_ServerGroupFallsBackGracefully(t *testing.T) {
+	// Server-group identifiers cause GetServer to 404. We should swallow that
+	// and fall back to the repository default branch's tip.
+	mux := &branchEndpointMux{
+		servers:        map[string]sdk.Server{}, // any GetServer → 404
+		latestRevision: "sha-of-default",
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "group-id", "", "", nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "", branch, "no branch when server-group has no preferred branch")
+	assert.Equal(t, "sha-of-default", revision)
+	assert.True(t, mux.latestRevCalled)
+}
+
+func TestResolveBranchAndRevision_ExplicitRevisionRespected(t *testing.T) {
+	// When --revision is explicit, no API calls should be needed and the
+	// caller's SHA must pass through unchanged.
+	mux := &branchEndpointMux{}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownServer := &sdk.Server{Identifier: "srv-1", PreferredBranch: "main"}
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-1", "feature-x", "explicit-sha", knownServer, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "feature-x", branch)
+	assert.Equal(t, "explicit-sha", revision)
+	assert.False(t, mux.branchesCalled)
+	assert.False(t, mux.latestRevCalled)
+}
+
+func TestResolveBranchAndRevision_UnknownBranchErrors(t *testing.T) {
+	// If --branch points at a branch that doesn't exist, we must error out
+	// rather than silently deploy the repo default's tip.
+	mux := &branchEndpointMux{
+		branches: map[string]string{"main": "sha-of-main"},
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	_, _, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "", "nope", "", nil, nil,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"nope"`)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestResolveBranchAndRevision_FallsBackWhenNoBranchAvailable(t *testing.T) {
+	// No --branch, no server, no preferred_branch → use repo default revision.
+	mux := &branchEndpointMux{latestRevision: "sha-of-default"}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "", "", "", nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "", branch)
+	assert.Equal(t, "sha-of-default", revision)
+	assert.True(t, mux.latestRevCalled)
+}
+
+func TestResolveStartRevision_DefaultsToServerLastRevision(t *testing.T) {
+	// Issue #5: dhq deploy was always doing a full-branch deploy because it
+	// never populated start_revision. The default for an incremental deploy is
+	// the server's last successfully deployed commit.
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: "last-deploy-sha"}
+	got := resolveStartRevision(srv, nil, "", false)
+	assert.Equal(t, "last-deploy-sha", got)
+}
+
+func TestResolveStartRevision_FlagOverridesServerLastRevision(t *testing.T) {
+	// --start-revision is the explicit override path (e.g. for hotfixes
+	// starting from a specific commit other than the last deploy).
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: "last-deploy-sha"}
+	got := resolveStartRevision(srv, nil, "explicit-start", false)
+	assert.Equal(t, "explicit-start", got)
+}
+
+func TestResolveStartRevision_FullForcesEmpty(t *testing.T) {
+	// --full means "deploy entire branch from first commit" — the API treats
+	// an empty start_revision as that signal.
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: "last-deploy-sha"}
+	got := resolveStartRevision(srv, nil, "", true)
+	assert.Equal(t, "", got, "--full must clear start_revision even when server has a last_revision")
+}
+
+func TestResolveStartRevision_FullBeatsExplicitFlag(t *testing.T) {
+	// Defensive: even if both somehow get through (the cobra-level mutual
+	// exclusivity check should catch it), --full wins.
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: "last-deploy-sha"}
+	got := resolveStartRevision(srv, nil, "explicit-start", true)
+	assert.Equal(t, "", got)
+}
+
+func TestResolveStartRevision_NilTargetsReturnEmpty(t *testing.T) {
+	// Project-wide deploys have no Server or ServerGroup to read from — fall
+	// back to "" and let the API decide per server.
+	got := resolveStartRevision(nil, nil, "", false)
+	assert.Equal(t, "", got)
+}
+
+func TestResolveStartRevision_NilTargetsStillRespectFlag(t *testing.T) {
+	// Even without a resolved target, an explicit --start-revision must be honored.
+	got := resolveStartRevision(nil, nil, "explicit-start", false)
+	assert.Equal(t, "explicit-start", got)
+}
+
+func TestResolveStartRevision_FreshServerReturnsEmpty(t *testing.T) {
+	// A server that has never been deployed has LastRevision="". First deploy
+	// must be a full one — there's no incremental baseline to start from.
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: ""}
+	got := resolveStartRevision(srv, nil, "", false)
+	assert.Equal(t, "", got)
+}
+
+func TestResolveStartRevision_GroupLastRevisionUsedWhenNoServer(t *testing.T) {
+	// DHQ-586 follow-up: deploying to a server group must be incremental from
+	// the group's last deploy. Without this, `dhq deploy -s "My Group"` always
+	// did a full deploy from the first commit even when the group had a deploy
+	// history. ServerGroup#last_revision (Rails) returns the end_revision of
+	// the group's most recent deployment, which is exactly what we want.
+	group := &sdk.ServerGroup{Identifier: "grp-1", LastRevision: "group-last-sha"}
+	got := resolveStartRevision(nil, group, "", false)
+	assert.Equal(t, "group-last-sha", got)
+}
+
+func TestResolveStartRevision_GroupIgnoredWhenServerHasLastRevision(t *testing.T) {
+	// When both a server and group are present (single-server resolution),
+	// the server's LastRevision takes precedence. Groups only matter when the
+	// target is the group itself (resolvedServer == nil).
+	srv := &sdk.Server{Identifier: "srv-1", LastRevision: "server-last-sha"}
+	group := &sdk.ServerGroup{Identifier: "grp-1", LastRevision: "group-last-sha"}
+	got := resolveStartRevision(srv, group, "", false)
+	assert.Equal(t, "server-last-sha", got)
+}
+
+func TestResolveStartRevision_FreshGroupReturnsEmpty(t *testing.T) {
+	// A newly-created group has no deployment history → LastRevision="" →
+	// first group deploy is correctly treated as a full deploy.
+	group := &sdk.ServerGroup{Identifier: "grp-1", LastRevision: ""}
+	got := resolveStartRevision(nil, group, "", false)
+	assert.Equal(t, "", got)
+}
+
+func TestResolveStartRevision_FullClearsGroupLastRevision(t *testing.T) {
+	// --full overrides incremental for group deploys too.
+	group := &sdk.ServerGroup{Identifier: "grp-1", LastRevision: "group-last-sha"}
+	got := resolveStartRevision(nil, group, "", true)
+	assert.Equal(t, "", got)
+}
+
+func TestDeployFullMutuallyExclusiveWithStartRevision(t *testing.T) {
+	cmd := NewRootCmd("test")
+	cmd.SetArgs([]string{"deploy", "--full", "--start-revision", "abc123", "-p", "test-project"})
+	err := cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
+}
+
+func TestDeployStartRevisionFlagsRegistered(t *testing.T) {
+	cmd := NewRootCmd("test")
+	deployCmd, _, _ := cmd.Find([]string{"deploy"})
+	require.NotNil(t, deployCmd)
+	assert.NotNil(t, deployCmd.Flags().Lookup("start-revision"))
+	assert.NotNil(t, deployCmd.Flags().Lookup("full"))
+}
+
+func TestResolveGroupName_ExactMatch(t *testing.T) {
+	// DHQ-586: passing the group's display name to -s must resolve to its identifier.
+	groups := []sdk.ServerGroup{
+		{Identifier: "grp-prod", Name: "Production"},
+		{Identifier: "grp-stag", Name: "Staging"},
+	}
+	id, name := resolveGroupName("Production", groups)
+	assert.Equal(t, "grp-prod", id)
+	assert.Equal(t, "Production", name)
+}
+
+func TestResolveGroupName_CaseInsensitive(t *testing.T) {
+	groups := []sdk.ServerGroup{{Identifier: "grp-prod", Name: "Production"}}
+	id, _ := resolveGroupName("production", groups)
+	assert.Equal(t, "grp-prod", id)
+}
+
+func TestResolveGroupName_NormalizedMatch(t *testing.T) {
+	// "us-prod" should match "US Prod" via the normalize tier.
+	groups := []sdk.ServerGroup{
+		{Identifier: "grp-us", Name: "US Prod"},
+		{Identifier: "grp-eu", Name: "EU Prod"},
+	}
+	id, name := resolveGroupName("us-prod", groups)
+	assert.Equal(t, "grp-us", id)
+	assert.Equal(t, "US Prod", name)
+}
+
+func TestResolveGroupName_ContainsMatch(t *testing.T) {
+	groups := []sdk.ServerGroup{
+		{Identifier: "grp-prod", Name: "Production Cluster"},
+		{Identifier: "grp-stag", Name: "Staging Cluster"},
+	}
+	id, _ := resolveGroupName("Production", groups)
+	assert.Equal(t, "grp-prod", id)
+}
+
+func TestResolveGroupName_AmbiguousReturnsEmpty(t *testing.T) {
+	// Multiple contains matches → don't auto-pick. Caller falls back to the
+	// existing server picker / "specify which one" error.
+	groups := []sdk.ServerGroup{
+		{Identifier: "grp-1", Name: "Production US"},
+		{Identifier: "grp-2", Name: "Production EU"},
+	}
+	id, _ := resolveGroupName("Production", groups)
+	assert.Equal(t, "", id)
+}
+
+func TestResolveGroupName_NoMatch(t *testing.T) {
+	groups := []sdk.ServerGroup{{Identifier: "grp-prod", Name: "Production"}}
+	id, _ := resolveGroupName("Nonexistent", groups)
+	assert.Equal(t, "", id)
+}
+
+func TestResolveBranchAndRevision_PreferredBranchEmptyFallsToBranchField(t *testing.T) {
+	// Some servers populate Branch but not PreferredBranch. Treat both as the
+	// same source of truth.
+	mux := &branchEndpointMux{
+		branches: map[string]string{"legacy": "sha-of-legacy"},
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownServer := &sdk.Server{
+		Identifier: "srv-1",
+		Branch:     "legacy", // PreferredBranch left empty
+	}
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-1", "", "", knownServer, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "legacy", branch)
+	assert.Equal(t, "sha-of-legacy", revision)
+}
+
+func TestResolveBranchAndRevision_UsesGroupPreferredBranch(t *testing.T) {
+	// DHQ-586 follow-up: when -s resolves to a server group, the group's
+	// preferred_branch must drive the deploy — otherwise the API gets
+	// end_revision from /repository/latest_revision (the default branch's tip),
+	// which can mismatch the group's intended branch.
+	mux := &branchEndpointMux{
+		branches: map[string]string{
+			"main":    "sha-of-main",
+			"release": "sha-of-release",
+		},
+		latestRevision: "sha-of-main",
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownGroup := &sdk.ServerGroup{Identifier: "grp-1", PreferredBranch: "release"}
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "grp-1", "", "", nil, knownGroup,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "release", branch, "group's preferred_branch must be honored")
+	assert.Equal(t, "sha-of-release", revision, "must be release's tip, not main's")
+	assert.True(t, mux.branchesCalled, "should query /branches to map branch→sha")
+	assert.False(t, mux.latestRevCalled, "should NOT fall back to repo default")
+}
+
+func TestResolveBranchAndRevision_FetchesGroupWhenServerFails(t *testing.T) {
+	// When the caller didn't pre-resolve the target and the identifier is a
+	// group's UUID, GetServer 404s. We must fall through to GetServerGroup
+	// rather than silently dropping to the repo default branch.
+	mux := &branchEndpointMux{
+		branches: map[string]string{"staging": "sha-of-staging"},
+		servers:  map[string]sdk.Server{}, // GetServer → 404
+		groups: map[string]sdk.ServerGroup{
+			"grp-uuid": {Identifier: "grp-uuid", PreferredBranch: "staging"},
+		},
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "grp-uuid", "", "", nil, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "staging", branch)
+	assert.Equal(t, "sha-of-staging", revision)
+	assert.Equal(t, "grp-uuid", mux.getServerCalledWith, "should attempt GetServer first")
+	assert.Equal(t, "grp-uuid", mux.getServerGroupCalledWith, "should fall through to GetServerGroup")
+}
+
+func TestResolveBranchAndRevision_ServerPreferredBranchBeatsGroup(t *testing.T) {
+	// When both a server and a group surface a preferred_branch (e.g. the
+	// caller resolved a single-server target but also fetched its group),
+	// the server's setting wins because it's the more specific target.
+	mux := &branchEndpointMux{
+		branches: map[string]string{
+			"server-branch": "sha-of-server",
+			"group-branch":  "sha-of-group",
+		},
+	}
+	srv := httptest.NewServer(mux.handler(t))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+
+	knownServer := &sdk.Server{Identifier: "srv-1", PreferredBranch: "server-branch"}
+	knownGroup := &sdk.ServerGroup{Identifier: "grp-1", PreferredBranch: "group-branch"}
+
+	branch, revision, err := resolveBranchAndRevision(
+		t.Context(), client, "p", "srv-1", "", "", knownServer, knownGroup,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "server-branch", branch)
+	assert.Equal(t, "sha-of-server", revision)
+}
+
+func TestTranslateParentMustExistError_RewritesMessageField(t *testing.T) {
+	in := &sdk.APIError{StatusCode: 422, Message: "parent must exist"}
+	out := translateParentMustExistError(in, "abc123de")
+	require.Error(t, out)
+	// Sha must be in Message (telemetry preserves first line).
+	firstLine := strings.SplitN(out.Error(), "\n", 2)[0]
+	assert.Contains(t, firstLine, "No prior deployment matches start_revision abc123de")
+	assert.Contains(t, out.Error(), "--full")
+	assert.Contains(t, out.Error(), "--start-revision <sha>")
+}
+
+func TestTranslateParentMustExistError_RewritesErrorsArray(t *testing.T) {
+	// The Rails validator usually returns the message in the "errors" array,
+	// not the "error" field. The translation must catch both shapes.
+	in := &sdk.APIError{StatusCode: 422, Errors: []string{"parent must exist", "something else"}}
+	out := translateParentMustExistError(in, "deadbeef")
+	require.Error(t, out)
+	assert.Contains(t, out.Error(), "deadbeef")
+	assert.Contains(t, out.Error(), "--full")
+}
+
+func TestTranslateParentMustExistError_EmptyStartRevisionShownExplicitly(t *testing.T) {
+	in := &sdk.APIError{StatusCode: 422, Message: "parent must exist"}
+	out := translateParentMustExistError(in, "")
+	require.Error(t, out)
+	assert.Contains(t, out.Error(), "(none)",
+		"empty start_revision should be rendered as (none) so the user can tell")
+}
+
+func TestTranslateParentMustExistError_PassesThroughUnrelatedErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"nil", nil},
+		{"non-API error", assert.AnError},
+		{"422 but different validation", &sdk.APIError{StatusCode: 422, Message: "branch can't be blank"}},
+		{"parent-must-exist text on a non-422", &sdk.APIError{StatusCode: 500, Message: "parent must exist"}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			out := translateParentMustExistError(tc.err, "abc123")
+			// Untouched: same value (including nil).
+			assert.Equal(t, tc.err, out)
+		})
+	}
+}
+// testEnvelope returns an Envelope wired to a bytes.Buffer so Status messages
+// are captured for assertion.
+func testEnvelope() (*output.Envelope, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return &output.Envelope{Stdout: io.Discard, Stderr: &buf}, &buf
+}
+
+func TestResolveDeployProject_ConfiguredShortCircuits(t *testing.T) {
+	// No API server: a configured project must NOT trigger ListProjects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	env, _ := testEnvelope()
+
+	id, err := resolveDeployProject(t.Context(), client, "my-app", env)
+	require.NoError(t, err)
+	assert.Equal(t, "my-app", id)
+}
+
+func TestResolveDeployProject_AutoPicksLoneProject(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/projects", r.URL.Path)
+		_ = json.NewEncoder(w).Encode([]sdk.Project{{Identifier: "only-id", Name: "Only Project"}})
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	env, stderr := testEnvelope()
+
+	id, err := resolveDeployProject(t.Context(), client, "", env)
+	require.NoError(t, err)
+	assert.Equal(t, "only-id", id)
+	assert.Contains(t, stderr.String(), "Auto-selected project: Only Project")
+}
+
+func TestResolveDeployProject_MultipleProjectsListsThem(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]sdk.Project{
+			{Identifier: "a-id", Name: "Alpha"},
+			{Identifier: "b-id", Name: "Beta"},
+			{Identifier: "c-id", Name: "Gamma"},
+		})
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	// Non-interactive (agents, piped output): the multi-project case must fail
+	// with the structured list rather than prompt. Interactive callers instead
+	// get a picker (see resolveDeployProject), which isn't exercised here.
+	env := &output.Envelope{Stdout: io.Discard, Stderr: io.Discard, NonInteractive: true}
+
+	id, err := resolveDeployProject(t.Context(), client, "", env)
+	require.Error(t, err)
+	assert.Empty(t, id)
+	msg := err.Error()
+	// Headline preserved for telemetry continuity.
+	firstLine := strings.SplitN(msg, "\n", 2)[0]
+	assert.Equal(t, "No project specified", firstLine)
+	// Hint lists each project so agents can self-correct on retry.
+	assert.Contains(t, msg, "3 projects")
+	assert.Contains(t, msg, "a-id (Alpha)")
+	assert.Contains(t, msg, "b-id (Beta)")
+	assert.Contains(t, msg, "c-id (Gamma)")
+}
+
+// TestResolveDeployProject_JSONModeSkipsPicker guards the stdout=data contract:
+// --json on a TTY leaves NonInteractive false, but the picker must NOT run
+// because promptui renders to stdout and would corrupt JSON output. JSON mode
+// must take the structured-error path instead.
+func TestResolveDeployProject_JSONModeSkipsPicker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]sdk.Project{
+			{Identifier: "a-id", Name: "Alpha"},
+			{Identifier: "b-id", Name: "Beta"},
+		})
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	// Interactive TTY (NonInteractive false) but JSON output requested. WantsJSON()
+	// is true via JSONMode, so the picker must be skipped.
+	env := &output.Envelope{Stdout: io.Discard, Stderr: io.Discard, IsTTY: true, JSONMode: true}
+	require.True(t, env.WantsJSON())
+	require.False(t, env.NonInteractive)
+
+	id, err := resolveDeployProject(t.Context(), client, "", env)
+	require.Error(t, err)
+	assert.Empty(t, id)
+	assert.Equal(t, "No project specified", strings.SplitN(err.Error(), "\n", 2)[0])
+}
+
+func TestResolveDeployProject_ZeroProjects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]sdk.Project{})
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	env, _ := testEnvelope()
+
+	id, err := resolveDeployProject(t.Context(), client, "", env)
+	require.Error(t, err)
+	assert.Empty(t, id)
+	assert.Contains(t, err.Error(), "No project specified")
+	assert.Contains(t, err.Error(), "no projects yet")
+}
+
+func TestResolveDeployProject_APIErrorKeepsHeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	client := newTestSDKClient(t, srv)
+	env, _ := testEnvelope()
+
+	_, err := resolveDeployProject(t.Context(), client, "", env)
+	require.Error(t, err)
+	// The "No project specified" headline must survive telemetry sanitization
+	// (which keeps only the first line) so the failure bucket stays recognisable.
+	firstLine := strings.SplitN(err.Error(), "\n", 2)[0]
+	assert.Equal(t, "No project specified", firstLine)
+}
+
+// TestResolveLatestRevision_EmbedsStatusCodeInMessage guards the telemetry
+// regression: SanitizeErrorMessage keeps only the first line of err.Error(),
+// so anything in the Hint never reaches the dashboard. The status code must
+// be in the Message itself so we can distinguish 404 (repo not synced) from
+// 5xx (transient API) in the failure bucket.
+func TestResolveLatestRevision_EmbedsStatusCodeInMessage(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		body           string
+		wantInMessage  string
+		wantInHintPart string
+	}{
+		{
+			name:           "404 → repo-config hint",
+			status:         http.StatusNotFound,
+			body:           `{"status":"not_found","error_code":"record_not_found"}`,
+			wantInMessage:  "(api: 404)",
+			wantInHintPart: "may not be configured or synced",
+		},
+		{
+			name:           "500 → transient hint",
+			status:         http.StatusInternalServerError,
+			body:           `{"error":"boom"}`,
+			wantInMessage:  "(api: 500)",
+			wantInHintPart: "Try again in a moment",
+		},
+		{
+			name:           "503 → transient hint",
+			status:         http.StatusServiceUnavailable,
+			body:           `{"error":"upstream"}`,
+			wantInMessage:  "(api: 503)",
+			wantInHintPart: "Try again in a moment",
+		},
+		{
+			// Regression guard for the codex/coderabbit feedback on #21:
+			// non-404/non-5xx 4xx (auth, validation, rate limit) must
+			// preserve the API error text in the hint so users see the
+			// real cause — suggesting --revision wouldn't fix an auth
+			// failure.
+			name:           "401 → preserves API error text",
+			status:         http.StatusUnauthorized,
+			body:           `{"error":"Unauthorized"}`,
+			wantInMessage:  "(api: 401)",
+			wantInHintPart: "deployhq api: 401",
+		},
+		{
+			name:           "422 → preserves API error text",
+			status:         http.StatusUnprocessableEntity,
+			body:           `{"error":"validation failed"}`,
+			wantInMessage:  "(api: 422)",
+			wantInHintPart: "validation failed",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/projects/p/repository/latest_revision":
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.body))
+				case "/projects/p/deployments":
+					// Fallback also fails (no records); status 200 with empty list.
+					_, _ = w.Write([]byte(`{"pagination":{},"records":[]}`))
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			client := newTestSDKClient(t, srv)
+			rev, err := resolveLatestRevision(t.Context(), client, "p")
+			require.Error(t, err)
+			assert.Empty(t, rev)
+			// Mirror telemetry.SanitizeErrorMessage: it keeps only the first line.
+			// The status code MUST be on that line, not buried in the Hint.
+			firstLine := strings.SplitN(err.Error(), "\n", 2)[0]
+			assert.Contains(t, firstLine, tc.wantInMessage,
+				"status code must appear on the first line of err.Error() so telemetry preserves it; got %q", firstLine)
+			assert.Contains(t, err.Error(), tc.wantInHintPart,
+				"hint should be tailored to the failure mode")
+		})
+	}
+}
+
+// TestResolveLatestRevision_FallsBackToDeploymentRevision verifies that a
+// failed primary call doesn't surface an error when the deployment list
+// contains a usable end_revision.
+func TestResolveLatestRevision_FallsBackToDeploymentRevision(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/projects/p/repository/latest_revision":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/projects/p/deployments":
+			_, _ = w.Write([]byte(`{"pagination":{},"records":[{"end_revision":{"ref":"fallback-sha"}}]}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	client := newTestSDKClient(t, srv)
+	rev, err := resolveLatestRevision(t.Context(), client, "p")
+	require.NoError(t, err)
+	assert.Equal(t, "fallback-sha", rev)
+}

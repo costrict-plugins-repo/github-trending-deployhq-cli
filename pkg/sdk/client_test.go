@@ -1,0 +1,276 @@
+package sdk
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// newTestClient creates a Client that points at the given test server.
+func newTestClient(t *testing.T, server *httptest.Server) *Client {
+	t.Helper()
+	c, err := New("test", "user@example.com", "test-key")
+	require.NoError(t, err)
+	c.baseURL = mustParseURL(t, server.URL)
+	c.httpClient = server.Client()
+	return c
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	return u
+}
+
+func TestNew(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		c, err := New("myco", "user@test.com", "key123")
+		require.NoError(t, err)
+		assert.Equal(t, "https://myco.deployhq.com", c.baseURL.String())
+		assert.Equal(t, "user@test.com", c.email)
+	})
+
+	t.Run("missing account", func(t *testing.T) {
+		_, err := New("", "user@test.com", "key")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "account is required")
+	})
+
+	t.Run("missing email", func(t *testing.T) {
+		_, err := New("myco", "", "key")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "email is required")
+	})
+
+	t.Run("missing api key", func(t *testing.T) {
+		_, err := New("myco", "user@test.com", "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "api key is required")
+	})
+}
+
+func TestNewPublic(t *testing.T) {
+	t.Run("valid without credentials", func(t *testing.T) {
+		c, err := NewPublic("myco")
+		require.NoError(t, err)
+		assert.Equal(t, "https://myco.deployhq.com", c.baseURL.String())
+		assert.Empty(t, c.email)
+		assert.Empty(t, c.apiKey)
+	})
+
+	t.Run("missing account", func(t *testing.T) {
+		_, err := NewPublic("")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "account is required")
+	})
+}
+
+// newPublicTestClient creates a public (no-auth) Client pointed at the test server.
+func newPublicTestClient(t *testing.T, server *httptest.Server) *Client {
+	t.Helper()
+	c, err := NewPublic("test")
+	require.NoError(t, err)
+	c.baseURL = mustParseURL(t, server.URL)
+	c.httpClient = server.Client()
+	return c
+}
+
+// TestPublicClient_NoAuth verifies the public client works against a server
+// that requires no Authorization header (the empty header it sends is ignored).
+func TestPublicClient_NoAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// An empty basic-auth header (or none) must be acceptable — the
+		// server does not require credentials for these public endpoints.
+		user, pass, _ := r.BasicAuth()
+		assert.Empty(t, user)
+		assert.Empty(t, pass)
+
+		switch r.URL.Path {
+		case "/ip_ranges":
+			_, _ = w.Write([]byte(`{"all_ipv4":["1.2.3.0/24"]}`))
+		case "/packages":
+			_, _ = w.Write([]byte(`[{"permalink":"pro","name":"Pro"}]`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	c := newPublicTestClient(t, server)
+
+	ranges, err := c.GetIPRanges(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"1.2.3.0/24"}, ranges.AllIPv4)
+
+	pkgs, err := c.ListPackages(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pkgs, 1)
+	assert.Equal(t, "pro", pkgs[0].Permalink)
+}
+
+func TestClient_BasicAuth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		assert.True(t, ok, "basic auth should be present")
+		assert.Equal(t, "user@example.com", user)
+		assert.Equal(t, "test-key", pass)
+		assert.Equal(t, "application/json", r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]Project{})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.ListProjects(context.Background(), nil)
+	require.NoError(t, err)
+}
+
+func TestClient_APIError_SingleError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Project not found"})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.GetProject(context.Background(), "nonexistent")
+	require.Error(t, err)
+
+	apiErr, ok := err.(*APIError)
+	require.True(t, ok)
+	assert.Equal(t, 404, apiErr.StatusCode)
+	assert.Equal(t, "Project not found", apiErr.Message)
+	assert.True(t, apiErr.IsNotFound())
+	assert.True(t, IsNotFound(err))
+}
+
+func TestClient_APIError_MultipleErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(map[string][]string{"errors": {"name is required", "permalink is taken"}})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.CreateProject(context.Background(), ProjectCreateRequest{})
+	require.Error(t, err)
+
+	apiErr, ok := err.(*APIError)
+	require.True(t, ok)
+	assert.Equal(t, 422, apiErr.StatusCode)
+	assert.Len(t, apiErr.Errors, 2)
+	assert.True(t, apiErr.IsValidationError())
+}
+
+func TestClient_APIError_RateLimited_RetryAfter(t *testing.T) {
+	// A 429 with a Retry-After header must parse into IsRateLimited() + RetryAfter.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "provisioning rate limit reached"})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.CreateProject(context.Background(), ProjectCreateRequest{})
+	require.Error(t, err)
+
+	apiErr, ok := err.(*APIError)
+	require.True(t, ok)
+	assert.Equal(t, 429, apiErr.StatusCode)
+	assert.True(t, apiErr.IsRateLimited())
+	assert.True(t, IsRateLimited(err))
+	assert.Equal(t, 42, apiErr.RetryAfter)
+	// 429 must not be mistaken for the 422 cap.
+	assert.False(t, apiErr.IsValidationError())
+}
+
+func TestClient_APIError_RateLimited_NoRetryAfter(t *testing.T) {
+	// A 429 without a Retry-After header is still rate-limited; RetryAfter is 0.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "slow down"})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.CreateProject(context.Background(), ProjectCreateRequest{})
+	require.Error(t, err)
+
+	apiErr, ok := err.(*APIError)
+	require.True(t, ok)
+	assert.True(t, apiErr.IsRateLimited())
+	assert.Equal(t, 0, apiErr.RetryAfter)
+}
+
+func TestClient_APIError_Unauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid credentials"})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	_, err := c.ListProjects(context.Background(), nil)
+	require.Error(t, err)
+	assert.True(t, IsUnauthorized(err))
+}
+
+func TestClient_UserAgent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, r.Header.Get("User-Agent"), "my-agent")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]Project{})
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	c.userAgent = "my-agent"
+	_, err := c.ListProjects(context.Background(), nil)
+	require.NoError(t, err)
+}
+
+func TestAppendListParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		opts     *ListOptions
+		expected string
+	}{
+		{"nil opts", "/projects", nil, "/projects"},
+		{"page only", "/projects", &ListOptions{Page: 2}, "/projects?page=2"},
+		{"per_page only", "/projects", &ListOptions{PerPage: 10}, "/projects?per_page=10"},
+		{"both", "/projects", &ListOptions{Page: 3, PerPage: 25}, "/projects?page=3&per_page=25"},
+		{"zero values", "/projects", &ListOptions{}, "/projects"},
+		{"existing query string", "/templates/public?framework_type=rails", &ListOptions{Page: 2}, "/templates/public?framework_type=rails&page=2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := appendListParams(tt.path, tt.opts)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestClient_Do_EscapeHatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/custom/endpoint", r.URL.Path)
+		assert.Equal(t, http.MethodPost, r.Method)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, server)
+	var result map[string]string
+	err := c.Do(context.Background(), http.MethodPost, "/custom/endpoint", map[string]string{"key": "val"}, &result)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", result["result"])
+}

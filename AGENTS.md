@@ -1,0 +1,140 @@
+# CLAUDE.md
+
+## What is this?
+
+`deployhq-cli` is the official DeployHQ command-line interface — a Go binary that wraps the DeployHQ REST API. Designed for both humans and AI agents.
+
+## Development
+
+```bash
+go build ./cmd/dhq/        # binary outputs as dhq       # Build binary
+go test ./... -v               # Run all tests (96 tests)
+go vet ./...                   # Static analysis
+```
+
+## Architecture
+
+```
+pkg/sdk/           Public Go SDK (97 methods, zero internal/ imports)
+                    Clean boundary — extractable to standalone module later.
+
+internal/output/    Wrangler-pattern output engine
+                    stderr=human messages, stdout=data (table or JSON)
+                    --json <fields> for field selection
+                    DEPLOYHQ_OUTPUT_FILE for JSONL capture
+
+internal/config/    4-layer Viper config
+                    flags > env vars > .deployhq.toml > ~/.deployhq/config.toml
+
+internal/auth/      Keyring + file fallback credential storage
+
+internal/harness/   Agent detection (DEPLOYHQ_AGENT, CLAUDE_CODE, CI)
+
+internal/cli/       Command execution pipeline, lazy SDK client
+
+internal/commands/  All CLI commands (42 top-level, 155+ total)
+
+internal/version/   Update checker (GitHub releases API)
+
+internal/skillinstaller/  Detects installed AI agents (12 supported) and
+                    installs the DeployHQ skill into each one's native format.
+                    user-scope targets write to $HOME; project-scope targets
+                    write into the repo (opt-in via --agent). Powers
+                    `dhq skills` and the `dhq hello` onboarding step.
+
+skills/deployhq/    Agent skill guide + per-domain reference docs (9 files)
+                    SKILL.md is the entry point for any AI agent.
+
+skill-evals/deployhq/  Eval suite (69 cases) testing LLM → CLI translation
+                        run-evals.sh drives Claude API, checks command accuracy.
+```
+
+## Key Design Decisions
+
+- **Output contract**: stdout is ALWAYS data (table or JSON), stderr is ALWAYS human text. Never mixed.
+- **`--json <fields>`**: Field selection on any command. Piped output auto-switches to JSON.
+- **`FlexString` type**: The DeployHQ API inconsistently returns some fields as strings or numbers. `FlexString` handles both.
+- **`dhq api`**: Escape hatch covering all 144+ endpoints not in the command tree.
+- **Breadcrumbs**: JSON responses include suggested next commands with `resource` type and `id`.
+- **`--non-interactive`**: Strict mode that never prompts. Auto-enabled for detected agents and piped output. Ambiguous inputs fail with structured errors listing available options.
+- **Agent metadata**: `dhq commands --json` includes per-command `agent` object with `interactive`, `destructive`, `idempotent`, `safe_for_automation`, `resource_types`. Defined in `internal/commands/agent_metadata.go`.
+- **Structured errors**: Error responses include `exit_code`, `retryable`, and `recovery` actions.
+- **No login in CI**: `DEPLOYHQ_ACCOUNT` + `DEPLOYHQ_EMAIL` + `DEPLOYHQ_API_KEY` env vars.
+- **Pagination**: `--page` and `--per-page` on paginated list commands (deployments, servers, server-groups). JSON output includes `pagination` metadata when available. Non-paginated endpoints don't have these flags.
+- **Dry-run**: `dhq deploy --dry-run` creates a preview deployment without executing. Returns `preview_pending` status. Mutually exclusive with `--wait`.
+- **API spec**: `https://api.deployhq.com/docs` (OpenAPI 3.1.0, machine-readable JSON at `/docs.json`)
+
+## Testing
+
+- Unit tests use `httptest.NewServer` with recorded response shapes
+- `integration_test.go` validates types against real API JSON (golden tests)
+- Live staging tests: set env vars and run `/tmp/deployhq-smoke.sh`
+
+## API Type Gotchas
+
+The OpenAPI spec doesn't always match reality. Known divergences:
+- `Server.agent` is an object (not string) when populated
+- `Server.port` can be string or int depending on the server
+- `Timestamps.duration` is an int, not a string
+- `DeploymentStep.server` is an int (server ID), not a string
+- `DeploymentStep.total_items`/`completed_items` are ints
+- `*.servers` arrays on ExcludedFile/ConfigFile/SSHCommand contain objects, not strings
+- `DeploymentStepLog.id` is an int, not a string
+
+All handled by `FlexString` or `[]interface{}`.
+
+## Adding a New Resource
+
+1. Add types to `pkg/sdk/types.go` (or new file in `pkg/sdk/`)
+2. Add SDK methods (List/Get/Create/Update/Delete)
+3. Add CLI command in `internal/commands/`
+4. Register in `internal/commands/root.go`
+5. Add tests
+6. Add a `CHANGELOG.md` entry under `## [Unreleased]` (see Changelog & Releases)
+
+## Changelog & Releases
+
+**Every PR that changes observable behaviour adds an entry under `## [Unreleased]`
+in `CHANGELOG.md`**, grouped under `### Added` / `### Changed` / `### Fixed` /
+`### Breaking (SDK)`. Entries accumulate there across PRs; releasing is then just
+renaming the heading. Note `skills/` is `go:embed`-ed into the binary, so a skill
+or reference-doc correction ships to users and warrants an entry — only genuinely
+internal changes (refactors, test-only work, CI config) can skip it.
+
+Releasing is **manual and tag-driven**. Merging to `main` publishes nothing.
+
+1. Rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`.
+2. Update the compare links at the bottom of the file:
+   - `[Unreleased]: https://github.com/deployhq/deployhq-cli/compare/vX.Y.Z...HEAD`
+   - `[X.Y.Z]: https://github.com/deployhq/deployhq-cli/releases/tag/vX.Y.Z`
+3. Commit on `main` and **push it**: `git push origin main`.
+4. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
+
+Push `main` *before* the tag. Pushing a tag sends the reachable objects but does
+not move `refs/heads/main`, so tagging first leaves the release containing the
+changelog while `origin/main` still lacks it.
+
+The tag push is what triggers `release.yml` → GoReleaser. Tags are annotated
+(`-a`) by convention.
+
+**The version is not stored in the repo.** GoReleaser injects it from the tag
+(`-X main.version={{.Version}}`); `cmd/dhq/main.go` defaults to `dev` for local
+builds. There is no version file to bump.
+
+Two things that are easy to conflate:
+
+- GoReleaser's `changelog:` block in `.goreleaser.yaml` generates the **GitHub
+  release notes** from commit subjects. It never reads or writes `CHANGELOG.md`,
+  and it filters out `docs:`, `chore:`, `test:` and `ci:` commits.
+- `internal/version/update.go` reads `/releases/latest`, i.e. the latest
+  *published* release — not the tag. So the sequence is: tag → GoReleaser builds
+  → release published → each installed CLI notices on its **next invocation**.
+  Not instant, but not something you can take back either: don't tag ahead of an
+  API change the release depends on — deploy the backend first.
+
+## Distribution
+
+- GoReleaser: `.goreleaser.yaml` (linux/darwin/windows, amd64/arm64)
+- CI: `.github/workflows/ci.yml` (Go 1.25, lint, test -race)
+- Release: `.github/workflows/release.yml` (tag push triggers GoReleaser)
+- Examples: `examples/github-actions/` (3 deployment workflow patterns)

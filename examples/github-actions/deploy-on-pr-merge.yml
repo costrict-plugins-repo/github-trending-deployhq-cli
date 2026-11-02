@@ -1,0 +1,67 @@
+# .github/workflows/deploy-on-pr-merge.yml
+#
+# Deploy when a PR is merged, with deployment summary as PR comment.
+
+name: Deploy on PR merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+env:
+  DEPLOYHQ_ACCOUNT: ${{ secrets.DEPLOYHQ_ACCOUNT }}
+  DEPLOYHQ_EMAIL: ${{ secrets.DEPLOYHQ_EMAIL }}
+  DEPLOYHQ_API_KEY: ${{ secrets.DEPLOYHQ_API_KEY }}
+  DEPLOYHQ_PROJECT: my-app
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install DeployHQ CLI
+        run: curl -fsSL https://deployhq.com/install/cli | sh
+
+      - name: Deploy and wait
+        id: deploy
+        run: |
+          RESULT=$(dhq deploy \
+            --server production \
+            --revision ${{ github.event.pull_request.merge_commit_sha }} \
+            --wait --json)
+          DEP_ID=$(echo "$RESULT" | jq -r '.data.identifier')
+          STATUS=$(echo "$RESULT" | jq -r '.data.status')
+          DURATION=$(echo "$RESULT" | jq -r '.data.timestamps.duration // "?"')
+          SERVERS=$(echo "$RESULT" | jq -r '.data.servers | length')
+          echo "deployment_id=$DEP_ID" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+          echo "servers=$SERVERS" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.deploy.outputs.status }}' || 'unknown';
+            const depId = '${{ steps.deploy.outputs.deployment_id }}';
+            const duration = '${{ steps.deploy.outputs.duration }}';
+            const servers = '${{ steps.deploy.outputs.servers }}';
+            const icon = status === 'completed' ? ':white_check_mark:' : ':x:';
+
+            const body = `${icon} **Deployment ${status}**
+
+            | Field | Value |
+            |-------|-------|
+            | ID | \`${depId}\` |
+            | Duration | ${duration}s |
+            | Servers | ${servers} |
+            | Revision | \`${{ github.event.pull_request.merge_commit_sha }}\` |`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
