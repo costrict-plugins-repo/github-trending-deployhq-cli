@@ -1,0 +1,25 @@
+# Binaries
+/dhq
+/dhq
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config (user credentials/project defaults)
+.deployhq.toml
+
+# Test
+coverage.out
+*.test
+
+# Build
+/bin/
+/deployhq

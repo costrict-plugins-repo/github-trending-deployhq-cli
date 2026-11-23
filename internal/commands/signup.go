@@ -1,0 +1,325 @@
+package commands
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/deployhq/deployhq-cli/internal/auth"
+	"github.com/deployhq/deployhq-cli/internal/config"
+	"github.com/deployhq/deployhq-cli/internal/output"
+	"github.com/deployhq/deployhq-cli/pkg/sdk"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
+)
+
+// termsURL is DeployHQ's Terms of Service, which a person must accept to
+// create an account.
+const termsURL = "https://www.deployhq.com/terms"
+
+// signupInOwnTerminalHint is shown when sign-up can't prompt (for example when
+// run by an AI agent). The password must come from the person, typed at a
+// hidden prompt, never relayed through (or invented by) an agent.
+const signupInOwnTerminalHint = "Ask the person to run 'dhq signup' themselves " + auth.SeparateTerminal +
+	": it asks for the password at a hidden prompt and asks them to accept the " +
+	"Terms of Service. Never ask for, or make up, a password in an AI chat."
+
+// signupNonInteractiveMessage is the refusal when sign-up can't prompt. It
+// leads with what to do (hand sign-up to the person) rather than naming a
+// password flag.
+const signupNonInteractiveMessage = "Signing up needs the person at the keyboard: dhq can't ask for a password in non-interactive mode"
+
+func newSignupCmd() *cobra.Command {
+	var email, password, accountName, fullName string
+	var acceptTerms bool
+
+	cmd := &cobra.Command{
+		Use:   "signup",
+		Short: "Create a new DeployHQ account",
+		Long: `Sign up for a new DeployHQ account from your terminal. Credentials are saved automatically.
+
+You are asked to accept DeployHQ's Terms of Service (` + termsURL + `). In
+non-interactive mode, --accept-terms is required and states that the person
+creating the account has read and accepted them.
+
+After signing up, open the verification link DeployHQ emails you: until the
+email address is verified, DeployHQ refuses API requests.
+
+AI agents: do not run this with a password in the command. Ask the person to
+run 'dhq signup' themselves in a separate terminal window, not with the agent's
+'!' shortcut, which gives dhq no terminal to prompt in.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			env := cliCtx.Envelope
+			reader := bufio.NewReader(os.Stdin)
+
+			// Interactive prompts for missing fields
+			if email == "" {
+				if env.NonInteractive {
+					return &output.UserError{
+						Message: signupNonInteractiveMessage,
+						Hint:    signupInOwnTerminalHint,
+					}
+				}
+				fmt.Fprint(env.Stderr, "Email: ") //nolint:errcheck
+				input, _ := reader.ReadString('\n')
+				email = strings.TrimSpace(input)
+			}
+			if email == "" {
+				return &output.UserError{Message: "Email is required"}
+			}
+
+			if password == "" {
+				if env.NonInteractive {
+					return &output.UserError{
+						Message: signupNonInteractiveMessage,
+						Hint:    signupInOwnTerminalHint,
+					}
+				}
+				fmt.Fprint(env.Stderr, "Password: ") //nolint:errcheck
+				pw, err := term.ReadPassword(int(os.Stdin.Fd()))
+				fmt.Fprintln(env.Stderr) //nolint:errcheck
+				if err != nil {
+					return &output.InternalError{Message: "read password", Cause: err}
+				}
+				password = strings.TrimSpace(string(pw))
+			}
+			if password == "" {
+				return &output.UserError{Message: "Password is required"}
+			}
+
+			if accountName == "" && !env.NonInteractive {
+				fmt.Fprint(env.Stderr, "Account name (optional, press Enter to auto-generate): ") //nolint:errcheck
+				input, _ := reader.ReadString('\n')
+				accountName = strings.TrimSpace(input)
+			}
+
+			if err := confirmSignupTerms(env, reader, acceptTerms); err != nil {
+				return err
+			}
+
+			env.Status("Creating account...")
+
+			ua := cliUserAgent()
+			req := sdk.SignupRequest{
+				Email:         email,
+				Password:      password,
+				AccountName:   accountName,
+				FullName:      fullName,
+				Client:        "dhq-cli",
+				TermsAccepted: true, // confirmed above, by prompt or --accept-terms
+			}
+
+			result, err := sdk.Signup(req, ua, cliCtx.Config.SignupURL())
+			if err != nil {
+				return err
+			}
+
+			// Auto-save credentials
+			credentialsSaved := true
+			accountOverride := ""
+			if err := auth.Store(&auth.Credentials{
+				Account: result.Account.Subdomain,
+				Email:   email,
+				APIKey:  result.APIKey,
+			}); err != nil {
+				credentialsSaved = false
+				env.Warn("Could not save credentials: %v", err)
+				env.Status("API key: %s", result.APIKey)
+			} else {
+				// Switch the CLI to the new account, as 'dhq auth login' does;
+				// otherwise an account already named in the global config
+				// keeps being used.
+				if err := config.Set(config.GlobalConfigPath(), "account", result.Account.Subdomain); err == nil {
+					accountOverride = accountStillOverridden(result.Account.Subdomain)
+				}
+			}
+
+			if env.WantsJSON() {
+				out := newSignupOutput(result, accountName, email)
+				out.CredentialsSaved = credentialsSaved
+				if !credentialsSaved {
+					// The key is not in the JSON, so the login has to be redone.
+					out.NextStep = strings.TrimSpace(credentialsNotSavedNextStep + " " + out.NextStep)
+				}
+				if accountOverride != "" {
+					out.NextStep = strings.TrimSpace(accountOverride + " " + out.NextStep)
+				}
+				summary := fmt.Sprintf("Account created: %s", result.Account.Subdomain)
+				if out.NextStep != "" {
+					summary += ". " + out.NextStep
+				}
+				// Until the email is verified the API refuses requests, so
+				// 'dhq auth status' (which says so) comes first and project
+				// commands wait for the verification.
+				next := output.Breadcrumb{Action: "projects", Cmd: "dhq projects list"}
+				if !result.EmailVerified {
+					next = output.Breadcrumb{Action: "create_project_once_email_verified", Cmd: "dhq projects create --name <name>"}
+				}
+				return env.WriteJSON(output.NewResponse(out, summary,
+					output.Breadcrumb{Action: "check_status", Cmd: "dhq auth status"},
+					next,
+				))
+			}
+
+			env.Status("")
+			output.ColorGreen.Fprintf(env.Stderr, "Account created!\n") //nolint:errcheck
+			env.Status("")
+			host := "deployhq.com"
+			if cliCtx.Config.Host != "" {
+				host = cliCtx.Config.Host
+			}
+			env.Status("  Account:     %s.%s", result.Account.Subdomain, host)
+			env.Status("  Email:       %s", email)
+			env.Status("  SSH Key:     %s", result.SSHPublicKey.Fingerprint)
+			env.Status("")
+			reportSignupOutcome(env, accountName, result, email, host)
+			if accountOverride != "" {
+				env.Warn("%s", accountOverride)
+			}
+			if !credentialsSaved {
+				env.Status(credentialsNotSavedNextStep)
+				if !result.EmailVerified {
+					env.Status("Do that once you've verified your email.")
+				}
+				return nil
+			}
+			if !result.EmailVerified {
+				env.Status("Credentials saved. Once you've verified your email:")
+				env.Status("  dhq auth status")
+				env.Status("  dhq projects create --name my-app")
+				return nil
+			}
+			env.Status("Credentials saved. Get started:")
+			env.Status("  dhq projects list")
+			env.Status("  dhq projects create --name my-app")
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&email, "email", "", "Email address")
+	cmd.Flags().StringVar(&password, "password", "", "Password")
+	cmd.Flags().StringVar(&accountName, "account-name", "", "Account subdomain (auto-generated if omitted)")
+	cmd.Flags().StringVar(&fullName, "full-name", "", "Full name")
+	cmd.Flags().BoolVar(&acceptTerms, "accept-terms", false, "Confirm the person has read and accepted the Terms of Service ("+termsURL+"); required in non-interactive mode")
+	return cmd
+}
+
+// confirmSignupTerms makes sure the person accepted the Terms of Service before
+// an account is created. Interactively it asks (an empty answer is a no); in
+// non-interactive mode it requires --accept-terms rather than assuming consent.
+func confirmSignupTerms(env *output.Envelope, reader *bufio.Reader, accepted bool) error {
+	if accepted {
+		return nil
+	}
+	if env.NonInteractive {
+		return &output.UserError{
+			Message: "Creating an account requires accepting DeployHQ's Terms of Service",
+			Hint: "Re-run with --accept-terms only after the person has read and accepted " + termsURL + ". " +
+				"Better: " + signupInOwnTerminalHint,
+		}
+	}
+	env.Status("")
+	env.Status("DeployHQ's Terms of Service: %s", termsURL)
+	fmt.Fprint(env.Stderr, "Do you accept the Terms of Service? [y/N]: ") //nolint:errcheck
+	answer, _ := reader.ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	}
+	return &output.UserError{
+		Message: "The Terms of Service must be accepted to create an account",
+		Hint:    "Review them at " + termsURL + ", then sign up again.",
+	}
+}
+
+// signupOutput is the --json payload of 'dhq signup': the API response plus
+// what the person needs to know about it.
+type signupOutput struct {
+	*sdk.SignupResponse
+	// APIKey hides the embedded response's key: the credentials are saved, so
+	// the key never needs to be in the output.
+	APIKey string `json:"api_key,omitempty"`
+	// RequestedAccountName is set when the account name the person asked for
+	// was not available as-is and a different subdomain was assigned.
+	RequestedAccountName string `json:"requested_account_name,omitempty"`
+	AccountNameChanged   bool   `json:"account_name_changed,omitempty"`
+	// CredentialsSaved says whether dhq saved the new login on this machine.
+	CredentialsSaved bool   `json:"credentials_saved"`
+	NextStep         string `json:"next_step,omitempty"`
+}
+
+// accountStillOverridden reports when the account just written to the global
+// config is not the one later commands will use, because the DEPLOYHQ_ACCOUNT
+// environment variable or this folder's .deployhq.toml names another account.
+// It returns "" when the new account is in effect.
+func accountStillOverridden(newAccount string) string {
+	cfg, err := config.Load()
+	// Exact match: stored logins are looked up by the exact account name.
+	if err != nil || cfg.Account == "" || cfg.Account == newAccount {
+		return ""
+	}
+	var source, fix string
+	switch cfg.Sources["account"] {
+	case "env":
+		source = "the DEPLOYHQ_ACCOUNT environment variable"
+		fix = "Unset it to use the new account."
+	case "file":
+		// The global config now holds the new account, so a different
+		// value read from a file comes from the project config, which can
+		// be in this folder or a parent folder.
+		source = "this folder's .deployhq.toml"
+		if path := config.FindProjectConfig(); path != "" {
+			if wd, err := os.Getwd(); err != nil || filepath.Dir(path) != wd {
+				source = path
+			}
+		}
+		fix = "Change or remove the account line there to use the new account."
+	default:
+		return ""
+	}
+	return fmt.Sprintf("dhq still uses account %q from %s, not %q. %s", cfg.Account, source, newAccount, fix)
+}
+
+// credentialsNotSavedNextStep is the next step when sign-up succeeded but the
+// new login could not be saved.
+const credentialsNotSavedNextStep = "The credentials could not be saved on this machine. " + signInNextStep
+
+func newSignupOutput(result *sdk.SignupResponse, requestedName, email string) signupOutput {
+	out := signupOutput{SignupResponse: result}
+	if accountNameChanged(requestedName, result.Account.Subdomain) {
+		out.RequestedAccountName = requestedName
+		out.AccountNameChanged = true
+	}
+	if !result.EmailVerified {
+		out.NextStep = verifyEmailNotice(email)
+	}
+	return out
+}
+
+// accountNameChanged reports whether the subdomain DeployHQ assigned differs
+// from the account name the person asked for. Names are made unique (acme,
+// acme2, acme3, ...) and normalised for use in a URL, so they can differ.
+func accountNameChanged(requested, assigned string) bool {
+	requested = strings.TrimSpace(requested)
+	return requested != "" && !strings.EqualFold(requested, assigned)
+}
+
+func verifyEmailNotice(email string) string {
+	return fmt.Sprintf("Check your inbox: DeployHQ sent a verification link to %s. "+
+		"Open it before using the account; until then DeployHQ refuses API requests (deploys, project changes)", email)
+}
+
+// reportSignupOutcome tells the person, after a successful sign-up, about a
+// changed account name and the email verification they still need to do.
+func reportSignupOutcome(env *output.Envelope, requestedName string, result *sdk.SignupResponse, email, host string) {
+	if accountNameChanged(requestedName, result.Account.Subdomain) {
+		env.Warn("The account name %q wasn't available as-is, so your account address is %s.%s",
+			requestedName, result.Account.Subdomain, host)
+	}
+	if !result.EmailVerified {
+		env.Status("%s.", verifyEmailNotice(email))
+		env.Status("")
+	}
+}

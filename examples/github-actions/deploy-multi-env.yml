@@ -1,0 +1,47 @@
+# .github/workflows/deploy-multi-env.yml
+#
+# Deploy to staging on push to main, production on release.
+# Uses GitHub Environments for per-environment secrets.
+
+name: Deploy (multi-environment)
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+env:
+  DEPLOYHQ_ACCOUNT: ${{ secrets.DEPLOYHQ_ACCOUNT }}
+  DEPLOYHQ_EMAIL: ${{ secrets.DEPLOYHQ_EMAIL }}
+  DEPLOYHQ_API_KEY: ${{ secrets.DEPLOYHQ_API_KEY }}
+  DEPLOYHQ_PROJECT: my-app
+
+jobs:
+  deploy-staging:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Install DeployHQ CLI
+        run: curl -fsSL https://deployhq.com/install/cli | sh
+
+      - name: Deploy to staging
+        run: dhq deploy --server staging --revision ${{ github.sha }} --wait --json
+
+  deploy-production:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Install DeployHQ CLI
+        run: curl -fsSL https://deployhq.com/install/cli | sh
+
+      - name: Deploy to production
+        run: dhq deploy --server production --revision ${{ github.sha }} --wait --json
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          PREV=$(dhq deployments list --json | jq -r '.data.records[1].identifier')
+          dhq rollback "$PREV" --json
